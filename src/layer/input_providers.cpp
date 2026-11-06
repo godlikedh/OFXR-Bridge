@@ -189,6 +189,11 @@ void prepare_input_providers(const wchar_t* directory) noexcept {
     }catch(...){fsr_diagnostic("provider_load_failed");}
 }
 void poll_input_providers() noexcept {
+    // Initialization can also poll before NGX exists. Serialize that with the
+    // monitor so providers may keep their background worker state local.
+    static std::mutex mutex;
+    std::unique_lock lock(mutex,std::try_to_lock);
+    if(!lock.owns_lock())return;
     static std::uint64_t flushed{};
     const auto now=GetTickCount64();
     if(now-flushed>=1000) {
@@ -207,6 +212,7 @@ void configure_input_providers(ID3D12CommandQueue* queue,bool enabled) noexcept 
 void stop_input_providers(ID3D12CommandQueue* queue) noexcept {
     if(!registry().ready.load(std::memory_order_acquire))return;
     for(const auto& p:registry().providers)if(p.api.stop_queue)p.api.stop_queue(queue);
+    native_ingress::streamline_camera::enable_fsr_tags(false);
 }
 void retire_provider_recording(ID3D12GraphicsCommandList* list,bool submitting) noexcept {
     if(!registry().ready.load(std::memory_order_acquire))return;

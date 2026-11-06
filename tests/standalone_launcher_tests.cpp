@@ -518,6 +518,21 @@ int main() {
         std::filesystem::exists(support_cache / L"nvngx_dlssnr.dll")) return 1;
     for (const auto* name : required_support)
         if (read_file(support_cache / name) != "required-helper") return 1;
+    std::filesystem::create_directories(support_source/L"providers/tools/scripts");
+    std::filesystem::create_directories(support_source/L"providers/tools/diagnostics");
+    write_file(support_source/L"providers/example.ofxr-provider.dll","provider");
+    write_file(support_source/L"providers/tools/scripts/collect.ps1","collector");
+    write_file(support_source/L"providers/tools/diagnostics/private.zip","user-data");
+    write_file(support_source/L"ofxr_amd_fidelityfx_ml_dx12.dll","modern-provider");
+    if(!stage_runtime_support_files(support_source,support_cache,&support_error) ||
+        read_file(support_cache/L"providers/example.ofxr-provider.dll")!="provider" ||
+        read_file(support_cache/L"providers/tools/scripts/collect.ps1")!="collector" ||
+        read_file(support_cache/L"ofxr_amd_fidelityfx_ml_dx12.dll")!="modern-provider" ||
+        std::filesystem::exists(support_cache/L"providers/tools/diagnostics/private.zip"))return 1;
+    std::filesystem::remove_all(support_source/L"providers");
+    std::filesystem::remove_all(support_cache/L"providers");
+    std::filesystem::remove(support_source/L"ofxr_amd_fidelityfx_ml_dx12.dll");
+    std::filesystem::remove(support_cache/L"ofxr_amd_fidelityfx_ml_dx12.dll");
     write_file(support_source / L"nvngx_dlssnr.dll", "user-supplied-NR");
     if (!stage_runtime_support_files(support_source, support_cache, &support_error) ||
         read_file(support_cache / L"nvngx_dlssnr.dll") != "user-supplied-NR") return 1;

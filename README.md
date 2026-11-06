@@ -1,5 +1,7 @@
 # OFXR-BRIDGE
 
+This fork adds external input providers and retains generic AMD frame-generation improvements. Start with [the provider architecture and source guide](docs/INPUT_PROVIDERS.md). MSFS capture and companion tools live in a separate repository; they are not compiled into this layer.
+
 **Smoother VR with the graphics card you already have.**
 
 OFXR-BRIDGE adds extra frames between the ones your game draws. Your headset
