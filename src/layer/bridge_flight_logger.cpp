@@ -204,7 +204,10 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
     if (length == 0 || length >= buffer.size()) {
         return {};
     }
-    return std::filesystem::path(buffer.data()) / L"ofxr-bridge" / L"Logs";
+    #ifndef XRFG_PROFILE_DIRECTORY
+#define XRFG_PROFILE_DIRECTORY L"ofxr-bridge"
+#endif
+    return std::filesystem::path(buffer.data()) / XRFG_PROFILE_DIRECTORY / L"Logs";
 }
 
 [[nodiscard]] std::wstring log_file_name() {

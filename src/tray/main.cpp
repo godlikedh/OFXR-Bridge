@@ -1326,7 +1326,7 @@ LRESULT CALLBACK window_procedure(
 
     std::filesystem::path directory;
     try {
-        directory = runtime_directory(local_app_data() / L"ofxr-bridge");
+        directory = runtime_directory(xrfg::autonomous::common_folder());
     } catch (...) {
         return EXIT_FAILURE;
     }
@@ -1337,12 +1337,12 @@ LRESULT CALLBACK window_procedure(
     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parsed_pid));
     std::wstring error;
     const bool cleaned = watch_registered_arm(parent, manifest,
-        local_app_data() / L"ofxr-bridge", &error, scope,
+        xrfg::autonomous::common_folder(), &error, scope,
         xrfg::implicit_layer::kRegistrySubkey, vulkan_manifest);
     if (parent != nullptr) {
         CloseHandle(parent);
     }
-    log_lifecycle(local_app_data() / L"ofxr-bridge", L"watchdog-cleanup", error);
+    log_lifecycle(xrfg::autonomous::common_folder(), L"watchdog-cleanup", error);
     return cleaned ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1402,7 +1402,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int) {
     AppState state;
     try {
         state.executable_directory = executable_directory();
-        state.local_directory = local_app_data() / L"ofxr-bridge";
+        state.local_directory = xrfg::autonomous::common_folder();
         state.settings_path = xrfg::autonomous::global_configuration_path();
         std::wstring cleanup_error;
         if (!cleanup_all_owned_registrations(state, &cleanup_error)) {

@@ -2086,7 +2086,7 @@ if(XRFG_BUILD_TESTS)
 endif()
 
 set(XRFG_PROFILE_DIRECTORY "ofxr-bridge" CACHE STRING "Local application profile directory")
-foreach(target xrfg_autonomous_control xrfg_d3d12_history)
+foreach(target xrfg_autonomous_control xrfg_d3d12_history xrfg_bridge_flight_logger)
     if(TARGET ${target})
         target_compile_definitions(${target} PRIVATE XRFG_PROFILE_DIRECTORY=L"${XRFG_PROFILE_DIRECTORY}")
     endif()
