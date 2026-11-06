@@ -2,6 +2,7 @@
 #include "input_provider_api.hpp"
 
 namespace xrfg {
+bool input_providers_observe_projection() noexcept;
 void prepare_input_providers(const wchar_t* layer_directory) noexcept;
 void poll_input_providers() noexcept;
 void configure_input_providers(ID3D12CommandQueue*, bool) noexcept;

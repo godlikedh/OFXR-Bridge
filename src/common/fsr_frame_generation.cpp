@@ -1,6 +1,5 @@
 #include "xrfg/fsr_frame_generation.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
-#include "xrfg/autonomous_control.hpp"
 #include <windows.h>
 #include <filesystem>
 #include <cstdio>
@@ -90,7 +89,10 @@ void fsr_diagnostic(const char* message, std::uint64_t a, std::uint64_t b,
             wchar_t root[32768]{};
             const auto n=GetEnvironmentVariableW(L"LOCALAPPDATA",root,32768);
             if (!n || n>=32768) return nullptr;
-            auto folder=autonomous::global_configuration_path().parent_path();
+#ifndef XRFG_PROFILE_DIRECTORY
+#define XRFG_PROFILE_DIRECTORY L"ofxr-bridge"
+#endif
+            auto folder=std::filesystem::path(root)/XRFG_PROFILE_DIRECTORY;
             std::filesystem::create_directories(folder);
             auto path=folder/(L"fsr-"+std::to_wstring(GetCurrentProcessId())+L".log");
             // Keep one writer, but permit the diagnostic collector to read

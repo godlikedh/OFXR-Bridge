@@ -2086,12 +2086,23 @@ if(XRFG_BUILD_TESTS)
 endif()
 
 set(XRFG_PROFILE_DIRECTORY "ofxr-bridge" CACHE STRING "Local application profile directory")
-if(TARGET xrfg_autonomous_control)
-    target_compile_definitions(xrfg_autonomous_control PRIVATE XRFG_PROFILE_DIRECTORY=L"${XRFG_PROFILE_DIRECTORY}")
-endif()
+foreach(target xrfg_autonomous_control xrfg_d3d12_history)
+    if(TARGET ${target})
+        target_compile_definitions(${target} PRIVATE XRFG_PROFILE_DIRECTORY=L"${XRFG_PROFILE_DIRECTORY}")
+    endif()
+endforeach()
 
 if(TARGET xrfg_d3d12_history_tests)
     add_custom_command(TARGET xrfg_d3d12_history_tests POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${XRFG_FSR_RUNTIME}" "$<TARGET_FILE_DIR:xrfg_d3d12_history_tests>/")
     add_test(NAME xrfg_fsr_warp COMMAND xrfg_d3d12_history_tests fsr-warp)
     set_tests_properties(xrfg_fsr_warp PROPERTIES TIMEOUT 180)
+endif()
+
+if(TARGET OFXRBridgeTray)
+    add_custom_command(TARGET OFXRBridgeTray POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/config/ofxr_fsr.ini" "$<TARGET_FILE_DIR:OFXRBridgeTray>/ofxr/ofxr_fsr.ini")
+    if(EXISTS "${XRFG_DEPENDENCY_ROOT}/runtime/ofxr_amd_fidelityfx_ml_dx12.dll")
+        add_custom_command(TARGET OFXRBridgeTray POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${XRFG_DEPENDENCY_ROOT}/runtime/ofxr_amd_fidelityfx_ml_dx12.dll" "$<TARGET_FILE_DIR:OFXRBridgeTray>/ofxr/")
+    endif()
 endif()

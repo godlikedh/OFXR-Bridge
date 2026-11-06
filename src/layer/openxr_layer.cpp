@@ -11137,7 +11137,7 @@ void refresh_release_bound_projection_guides(
 }
 
 void report_provider_projection_images(const ProjectionSnapshot& snapshot,const ProjectionMappingResult& mappings) noexcept {
-    if(!mappings.ready())return;
+    if(!mappings.ready() || !xrfg::input_providers_observe_projection())return;
     try {
         for(const auto& mapping:mappings.mappings) {
             const auto chain=find_swapchain(mapping.application_swapchain);if(!chain)continue;

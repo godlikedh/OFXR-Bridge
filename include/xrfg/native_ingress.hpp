@@ -14,10 +14,10 @@ void install_device(ID3D12Device* device) noexcept;
 // This grants no Luke/producer authority and applies equally to ordinary DLSS.
 // Once installed, observation is an atomic-only fast path on later evaluations.
 void observe_guide_list(ID3D12GraphicsCommandList* list) noexcept;
-using FsrRetireCallback=void(*)(ID3D12GraphicsCommandList*, bool submitting) noexcept;
-void set_fsr_retire_callback(FsrRetireCallback callback) noexcept;
-using FsrSubmissionCallback=void(*)(ID3D12CommandQueue*,unsigned,ID3D12CommandList* const*,ID3D12CommandList* const*) noexcept;
-void set_fsr_submission_callback(FsrSubmissionCallback callback) noexcept;
+using ProviderRetireCallback=void(*)(ID3D12GraphicsCommandList*, bool submitting) noexcept;
+void set_provider_retire_callback(ProviderRetireCallback callback) noexcept;
+using ProviderSubmissionCallback=void(*)(ID3D12CommandQueue*,unsigned,ID3D12CommandList* const*,ID3D12CommandList* const*) noexcept;
+void set_provider_submission_callback(ProviderSubmissionCallback callback) noexcept;
 // Bind only a native queue that actually executes an observed game SR/RR list.
 // Layer-created queues and queue creation alone are not producer evidence.
 void observe_luke_production(ID3D12GraphicsCommandList* list) noexcept;

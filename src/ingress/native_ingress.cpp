@@ -46,8 +46,8 @@ std::atomic_uint32_t handles{};
 std::atomic_uint pending_luke_lists{};
 std::atomic_bool has_luke_context{};
 std::atomic_bool has_reset_hook{};
-std::atomic<FsrRetireCallback> fsr_retire{};
-std::atomic<FsrSubmissionCallback> fsr_submission{};
+std::atomic<ProviderRetireCallback> fsr_retire{};
+std::atomic<ProviderSubmissionCallback> fsr_submission{};
 std::atomic<ULONGLONG> reset_hook_retry_at{};
 template<std::size_t N> bool finite(const std::array<float,N>& values) {
     for(float v:values)if(!std::isfinite(v))return false;
@@ -321,8 +321,8 @@ void observe_guide_list(ID3D12GraphicsCommandList* input) noexcept {
         }
     }catch(...){}
 }
-void set_fsr_retire_callback(FsrRetireCallback callback) noexcept {fsr_retire.store(callback,std::memory_order_relaxed);}
-void set_fsr_submission_callback(FsrSubmissionCallback callback) noexcept {fsr_submission.store(callback,std::memory_order_relaxed);}
+void set_provider_retire_callback(ProviderRetireCallback callback) noexcept {fsr_retire.store(callback,std::memory_order_relaxed);}
+void set_provider_submission_callback(ProviderSubmissionCallback callback) noexcept {fsr_submission.store(callback,std::memory_order_relaxed);}
 void observe_luke_production(ID3D12GraphicsCommandList* input) noexcept {
     observe_guide_list(input);
     if(!input || !luke_detected())return;

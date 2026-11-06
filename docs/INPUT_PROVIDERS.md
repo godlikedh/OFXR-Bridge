@@ -26,4 +26,6 @@ Attach a late camera to the exact returned stream/publication receipt before con
 
 ## Validation limits
 
+Prepare the pinned SDKs with `./scripts/Prepare-Dependencies.ps1` on Windows, then configure with CMake and build `OFXRBridgeTray`. The script prepares the existing NVIDIA/optical-flow dependencies as well as the AMD 2.4 headers and signed ML runtime. `ofxr_fsr.ini` beside the layer selects `auto`, `analytical`, or `ml`; `auto` retains the analytical fallback when ML requirements are absent.
+
 Windows/WARP tests cover API and GPU plumbing. Headset timing, hardware ML-provider behavior and game updates still require hardware validation. The interface is experimental ABI version 1, not an upstream compatibility promise.

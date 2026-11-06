@@ -183,8 +183,8 @@ void prepare_input_providers(const wchar_t* directory) noexcept {
             }
             set_fsr_background_diagnostics(!registry().providers.empty());
             registry().ready.store(true,std::memory_order_release);
-            native_ingress::set_fsr_retire_callback(&retire_provider_recording);
-            native_ingress::set_fsr_submission_callback(&report_provider_submission);
+            native_ingress::set_provider_retire_callback(&retire_provider_recording);
+            native_ingress::set_provider_submission_callback(&report_provider_submission);
         });
     }catch(...){fsr_diagnostic("provider_load_failed");}
 }
@@ -225,5 +225,9 @@ void report_provider_submission(ID3D12CommandQueue* queue,unsigned count,ID3D12C
 void report_provider_projection(const OFXR_ProjectionReceiptV1& receipt) noexcept {
     if(!registry().ready.load(std::memory_order_acquire))return;
     for(const auto& p:registry().providers)if(p.api.projection)p.api.projection(&receipt);
+}
+bool input_providers_observe_projection() noexcept {
+    if(!registry().ready.load(std::memory_order_acquire))return false;
+    return std::any_of(registry().providers.begin(),registry().providers.end(),[](const Provider& p){return p.api.projection!=nullptr;});
 }
 }
