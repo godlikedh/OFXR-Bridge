@@ -1,4 +1,5 @@
 #include "xrfg/provider_api.hpp"
+#include "xrfg/input_provider_api.hpp"
 #include <windows.h>
 #include <iostream>
 #include <stdexcept>
@@ -37,6 +38,24 @@ int main(int count, char** arguments) {
         const auto statistics1 = resolve<Statistics1>(module, "OFXR_GetDlssMotionVectorStatisticsV1");
         const auto statistics2 = resolve<Statistics2>(module, "OFXR_GetDlssGuideStatisticsV2");
         const auto publish2 = resolve<Publication2>(module, "OFXR_PublishDlssGuidesV2");
+        const auto provider_host=resolve<const OFXR_InputProviderHostV1*(*)(std::uint32_t) noexcept>(module,"OFXR_GetInputProviderHostV1");
+        require(!provider_host(0) && !provider_host(99),"unknown input-provider ABI refused");
+        const auto* host=provider_host(OFXR_INPUT_PROVIDER_ABI);
+        require(host && host->struct_size==sizeof(*host),"actual layer returns provider table");
+        OFXR_GuidePublicationV3 input;OFXR_GuideReceiptV3 receipt;
+        require(!host->publish(nullptr,&receipt) && !host->publish(&input,nullptr) &&
+            !host->publish(&input,&receipt),"provider rejects null/missing GPU inputs");
+        input.api_version=99;
+        require(!host->publish(&input,&receipt),"provider refuses unknown guide version");
+        input.api_version=OFXR_GUIDE_ABI;input.struct_size=0;
+        require(!host->publish(&input,&receipt),"provider refuses truncated guide ABI");
+        OFXR_CameraV3 camera;
+        require(!host->attach_camera(1,1,nullptr) && !host->attach_camera(1,1,&camera),"provider refuses invalid camera attachment");
+        require(!host->query_camera(nullptr,&camera),"provider refuses missing camera receipt");
+        OFXR_ProviderStatusV1 status;
+        require(host->get_status(&status) && status.struct_size==sizeof(status),"provider status works across actual DLL boundary");
+        status.struct_size=0;
+        require(!host->get_status(&status) && !host->get_status(nullptr),"provider status rejects truncated ABI");
         require(version1() == 1 && version2() == 2, "versioned native producer ABI");
         for (const auto name : {"OFXR_OptiScalerProviderV1", "OFXR_RegisterOptiScalerProviderV2",
             "OFXR_UnregisterOptiScalerProviderV2"})

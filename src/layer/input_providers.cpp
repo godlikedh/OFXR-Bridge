@@ -78,7 +78,7 @@ int publish(const OFXR_GuidePublicationV3* in, OFXR_GuideReceiptV3* out) noexcep
 }
 
 int attach_camera(std::uint64_t stream,std::uint64_t publication,const OFXR_CameraV3* in) noexcept {
-    if(!in || !valid_camera(*in))return 0;
+    if(!in || !in->frame_token_valid || !valid_camera(*in))return 0;
     DlssCameraAttachment c{};
     std::copy_n(in->position,3,c.position.begin());std::copy_n(in->right,3,c.right.begin());
     std::copy_n(in->up,3,c.up.begin());std::copy_n(in->forward,3,c.forward.begin());
@@ -137,6 +137,13 @@ int get_status(OFXR_ProviderStatusV1* out) noexcept {
         return 1;
     }catch(...){return 0;}
 }
+}
+
+// Optional dynamically resolved entry point for an already-loaded provider.
+// Returning the table does not register or start any capture hooks.
+extern "C" __declspec(dllexport) const OFXR_InputProviderHostV1*
+OFXR_GetInputProviderHostV1(std::uint32_t abi) noexcept {
+    return abi==OFXR_INPUT_PROVIDER_ABI?&xrfg::input_provider_host():nullptr;
 }
 
 const OFXR_InputProviderHostV1& input_provider_host() noexcept {
