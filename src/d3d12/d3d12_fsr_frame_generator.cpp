@@ -2,6 +2,8 @@
 
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
+#include "xrfg/fsr_provider_policy.hpp"
+#include "xrfg/fsr_runtime_requirements.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <limits>
 #include <utility>
@@ -237,6 +240,11 @@ bool fsr_generated_array_description(
 struct D3D12FsrFrameGenerator::Impl {
     struct Eye {
         ffxContext context{};
+        // API creation-chain pointers remain live for the context lifetime.
+        ffxCreateBackendDX12Desc backend{};
+        ffxOverrideVersion override_version{};
+        ffxCreateContextDescFrameGenerationVersion api_version{};
+        ffxCreateContextDescFrameGeneration creation{};
         ComPtr<ID3D12Resource> color;
         ComPtr<ID3D12Resource> depth;
         ComPtr<ID3D12Resource> motion;
@@ -265,6 +273,11 @@ struct D3D12FsrFrameGenerator::Impl {
     PfnFfxDestroyContext destroy_context{};
     PfnFfxConfigure configure{};
     PfnFfxDispatch dispatch{};
+    PfnFfxQuery query{};
+    bool ml{};
+    std::uint64_t ml_version{};
+    ULONGLONG retry_after{};
+    HRESULT last_load_error{E_FAIL};
 
     ~Impl() { shutdown(); }
 
@@ -284,20 +297,69 @@ struct D3D12FsrFrameGenerator::Impl {
         destroy_context = nullptr;
         configure = nullptr;
         dispatch = nullptr;
+        query = nullptr;
+        ml = false;
+        ml_version = 0;
     }
 
-    HRESULT load_runtime() noexcept {
+    HRESULT load_runtime(bool scene_camera) noexcept {
         if (module && create_context && destroy_context && configure && dispatch)
-            return S_OK;
+            return ml && !scene_camera ? E_INVALIDARG : S_OK;
+        if(GetTickCount64()<retry_after)return last_load_error;
+        // Missing/unsupported providers should not cause per-frame DLL loads.
+        retry_after=GetTickCount64()+5000;
+        last_load_error=HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         const auto directory = module_directory();
         if (directory.empty()) return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+        wchar_t request_name[32]{};
+        GetPrivateProfileStringW(L"fsr", L"provider", L"auto", request_name, 32,
+            (directory / L"ofxr_fsr.ini").c_str());
+        const auto request = !_wcsicmp(request_name, L"ml") ? FsrProviderRequest::ml :
+            !_wcsicmp(request_name, L"analytical") ? FsrProviderRequest::analytical : FsrProviderRequest::automatic;
+        const auto caps = fsr_runtime_requirements(device.Get());
+        fsr_diagnostic("fsr_runtime_requirements", caps.build,
+            (UINT64(caps.vendor) << 32) | caps.device, caps.shader_model66, scene_camera);
+        HMODULE candidate{};
+        if (request != FsrProviderRequest::analytical && caps.windows11 && caps.amd && caps.shader_model66 && scene_camera) {
+            candidate = LoadLibraryExW((directory / L"ofxr_amd_fidelityfx_ml_dx12.dll").c_str(), nullptr,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (candidate) {
+                auto candidate_query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(candidate, "ffxQuery"));
+                std::array<uint64_t,16> ids{}; std::array<const char*,16> names{};
+                uint64_t count = ids.size();
+                ffxQueryDescGetVersions versions{};
+                versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+                versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+                versions.device = device.Get(); versions.outputCount = &count;
+                versions.versionIds = ids.data(); versions.versionNames = names.data();
+                if (candidate_query && candidate_query(nullptr, &versions.header) == FFX_API_RETURN_OK && count <= ids.size()) {
+                    for (size_t i=0;i<count;++i) {
+                        fsr_diagnostic(names[i] ? names[i] : "fsr_provider_unnamed", ids[i]);
+                        if (names[i] && fsr_ml_version(names[i])) ml_version = ids[i];
+                    }
+                }
+            }
+        }
+        const auto choice = choose_fsr_provider(request,caps.windows11,caps.shader_model66,caps.amd,scene_camera,ml_version!=0);
+        if (choice == FsrProviderChoice::unavailable) {
+            if (candidate) FreeLibrary(candidate);
+            fsr_diagnostic("fsr_ml_unavailable_no_fallback", caps.windows11, caps.shader_model66, scene_camera, ml_version);
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        }
+        ml = choice == FsrProviderChoice::ml;
+        if (ml) module = candidate;
+        else if (candidate) FreeLibrary(candidate);
         const auto isolated =
             directory / L"ofxr_amd_fidelityfx_framegeneration_dx12.dll";
-        module = LoadLibraryW(isolated.c_str());
+        if (!ml) module = LoadLibraryExW(isolated.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto load_error=GetLastError();
+        fsr_diagnostic(ml ? "fsr_selected_ml" : "fsr_selected_analytical", ml_version, scene_camera);
         if (!module) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::runtime_missing);
-            return HRESULT_FROM_WIN32(GetLastError());
+            last_load_error=HRESULT_FROM_WIN32(load_error);
+            return last_load_error;
         }
         create_context = reinterpret_cast<PfnFfxCreateContext>(
             GetProcAddress(module, "ffxCreateContext"));
@@ -307,6 +369,7 @@ struct D3D12FsrFrameGenerator::Impl {
             GetProcAddress(module, "ffxConfigure"));
         dispatch = reinterpret_cast<PfnFfxDispatch>(
             GetProcAddress(module, "ffxDispatch"));
+        query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(module, "ffxQuery"));
         if (!create_context || !destroy_context || !configure || !dispatch) {
             shutdown();
             report_fsr_frame_generation_status(
@@ -402,22 +465,43 @@ struct D3D12FsrFrameGenerator::Impl {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &eye.output);
         if (FAILED(result)) return result;
 
-        ffxCreateBackendDX12Desc backend{};
+        auto& backend = eye.backend;
         backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
         backend.device = device.Get();
-        ffxCreateContextDescFrameGeneration create{};
+        auto& create = eye.creation;
         create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         create.header.pNext = &backend.header;
+        if (ml) {
+            eye.override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+            eye.override_version.versionId = ml_version;
+            backend.header.pNext = &eye.override_version.header;
+            eye.api_version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+            eye.api_version.version = FFX_FRAMEGENERATION_VERSION;
+            eye.override_version.header.pNext = &eye.api_version.header;
+        }
         create.flags = flags;
         create.displaySize = {display_width, display_height};
         create.maxRenderSize = {render_width, render_height};
         create.backBufferFormat = ffxApiGetSurfaceFormatDX12(color_format);
+        const auto started=GetTickCount64();
+        fsr_diagnostic("fsr_context_init_begin",eye_index,display_width,display_height,ml);
         const auto code = create_context(&eye.context, &create.header, nullptr);
+        fsr_diagnostic("fsr_context_init_end",eye_index,GetTickCount64()-started,code,ml);
         if (code != FFX_API_RETURN_OK) {
+            fsr_diagnostic("fsr_create_failed", code, ml, eye_index);
             destroy_eye(eye);
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::initialization_failed);
             return E_FAIL;
+        }
+        ffxQueryGetProviderVersion actual{};
+        actual.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+        const auto queried = query ? query(&eye.context, &actual.header) : FFX_API_RETURN_ERROR;
+        fsr_diagnostic(actual.versionName ? actual.versionName : "fsr_context_provider_unknown",
+            actual.versionId, queried, eye_index, ml);
+        if (ml && (queried != FFX_API_RETURN_OK || actual.versionId != ml_version ||
+            !actual.versionName || !fsr_ml_version(actual.versionName))) {
+            destroy_eye(eye); return E_FAIL;
         }
         eye.display_width = display_width;
         eye.display_height = display_height;
@@ -452,6 +536,28 @@ struct D3D12FsrFrameGenerator::Impl {
         generated_array_state = D3D12_RESOURCE_STATE_COMMON;
         color_format = selected;
         return S_OK;
+    }
+
+    bool prepared(std::span<const D3D12FsrEyeInput> inputs) const noexcept {
+        if(!module || !generated_array || (ml && std::any_of(inputs.begin(),inputs.end(),
+            [](const auto& input){return !input.camera_data_valid;})))return false;
+        D3D12_RESOURCE_DESC required{};
+        if(!fsr_generated_array_description(array_description,inputs,&required))return false;
+        const auto actual=generated_array->GetDesc();
+        if(actual.Width!=required.Width || actual.Height!=required.Height ||
+            actual.DepthOrArraySize!=required.DepthOrArraySize)return false;
+        const bool shared=shared_stereo_slice(inputs);
+        for(size_t i=0;i<inputs.size();++i) {
+            const auto& input=inputs[i];const auto index=shared?i:input.output_slice;
+            if(!input.color || !input.depth || !input.motion_vectors || index>=eyes.size() ||
+                linear_color_format(input.color->GetDesc().Format)!=color_format ||
+                needs_recreate(eyes[index],input) ||
+                eyes[index].depth->GetDesc().Format!=input.depth->GetDesc().Format ||
+                eyes[index].motion->GetDesc().Format!=input.motion_vectors->GetDesc().Format ||
+                eyes[index].motion->GetDesc().Width!=input.motion_rect.width ||
+                eyes[index].motion->GetDesc().Height!=input.motion_rect.height)return false;
+        }
+        return true;
     }
 
     HRESULT copy_inputs(ID3D12GraphicsCommandList* commands,
@@ -556,7 +662,7 @@ struct D3D12FsrFrameGenerator::Impl {
         camera.header.pNext = &backend.header;
         ffxDispatchDescFrameGenerationPrepare prepare{};
         prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-        prepare.header.pNext = &camera.header;
+        prepare.header.pNext = input.camera_data_valid ? &camera.header : &backend.header;
         prepare.commandList = commands;
         prepare.frameID = frame_id;
         prepare.renderSize = {eye.render_width, eye.render_height};
@@ -567,13 +673,31 @@ struct D3D12FsrFrameGenerator::Impl {
         prepare.cameraNear = input.camera_near;
         prepare.cameraFar = input.camera_far;
         prepare.cameraFovAngleVertical = input.camera_fov_vertical;
-        prepare.viewSpaceToMetersFactor = 1.0F;
+        prepare.viewSpaceToMetersFactor = input.view_space_to_meters;
         prepare.depth = ffxApiGetResourceDX12(
             eye.depth.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         prepare.motionVectors = ffxApiGetResourceDX12(
             eye.motion.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        if (dispatch(&eye.context, &prepare.header) != FFX_API_RETURN_OK)
+        ffxReturnCode_t prepared{};
+        if (ml) {
+            ffxDispatchDescFrameGenerationPrepareV2 v2{};
+            v2.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+            v2.header.pNext = &backend.header;
+            v2.commandList = commands; v2.frameID = frame_id; v2.renderSize = prepare.renderSize;
+            v2.jitterOffset = prepare.jitterOffset; v2.motionVectorScale = prepare.motionVectorScale;
+            v2.frameTimeDelta = prepare.frameTimeDelta; v2.reset = input.reset || frame_id == 1;
+            v2.cameraNear = prepare.cameraNear; v2.cameraFar = prepare.cameraFar;
+            v2.cameraFovAngleVertical = prepare.cameraFovAngleVertical;
+            v2.viewSpaceToMetersFactor = prepare.viewSpaceToMetersFactor;
+            v2.depth = prepare.depth; v2.motionVectors = prepare.motionVectors;
+            std::copy_n(camera.cameraPosition,3,v2.cameraPosition); std::copy_n(camera.cameraUp,3,v2.cameraUp);
+            std::copy_n(camera.cameraRight,3,v2.cameraRight); std::copy_n(camera.cameraForward,3,v2.cameraForward);
+            prepared = dispatch(&eye.context, &v2.header);
+        } else prepared = dispatch(&eye.context, &prepare.header);
+        if (prepared != FFX_API_RETURN_OK) {
+            fsr_diagnostic("fsr_prepare_failed", prepared, ml, eye_index, frame_id);
             return E_FAIL;
+        }
 
         ffxDispatchDescFrameGeneration generation{};
         generation.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
@@ -590,7 +714,11 @@ struct D3D12FsrFrameGenerator::Impl {
         generation.minMaxLuminance[1] = 1.0F;
         generation.generationRect = configure_description.generationRect;
         generation.frameID = frame_id;
-        if (dispatch(&eye.context, &generation.header) != FFX_API_RETURN_OK)
+        const auto generated=dispatch(&eye.context, &generation.header);
+        if(generated!=FFX_API_RETURN_OK || frame_id<=4 || frame_id%120==0)
+            fsr_diagnostic("fsr_dispatch_result",generated,eye_index,frame_id,
+                unsigned(ml)|(unsigned(generation.reset)<<1));
+        if (generated != FFX_API_RETURN_OK)
             return E_FAIL;
         eye.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         return S_OK;
@@ -616,11 +744,76 @@ HRESULT D3D12FsrFrameGenerator::initialize(
         implementation->array_description.Flags = D3D12_RESOURCE_FLAG_NONE;
         implementation->color_format = linear_color_format(view_format);
         impl_ = std::move(implementation);
+        ++configuration_generation_;
+        initialization_retry_after_=0;
         report_fsr_frame_generation_status(
             FsrFrameGenerationStatus::waiting_for_guides);
         return S_OK;
     } catch (...) {
         return E_OUTOFMEMORY;
+    }
+}
+
+HRESULT D3D12FsrFrameGenerator::prepare(std::span<const D3D12FsrEyeInput> inputs) noexcept {
+    if(!impl_ || inputs.empty() || inputs.size()>kMaximumEyes)return E_INVALIDARG;
+    for(const auto& input:inputs)if(!input.color || !input.depth || !input.motion_vectors ||
+        !input.color_rect.width || !input.color_rect.height || !input.depth_rect.width ||
+        !input.depth_rect.height || !input.motion_rect.width || !input.motion_rect.height ||
+        input.output_slice>=kMaximumEyes)return E_INVALIDARG;
+    try {
+        if(initialization_.valid()) {
+            if(initialization_.wait_for(std::chrono::seconds(0))!=std::future_status::ready)
+                return DXGI_ERROR_WAS_STILL_DRAWING;
+            auto [result,ready]=initialization_.get();
+            if(FAILED(result)) {
+                initialization_retry_after_=GetTickCount64()+5000;
+                fsr_diagnostic("fsr_async_init_failed",static_cast<UINT>(result));
+                return result;
+            }
+            // A gaze/resolution/settings change during compilation must not
+            // install contexts prepared for the old input configuration.
+            if(initialization_generation_==configuration_generation_ && ready && ready->prepared(inputs)) {
+                impl_=std::move(ready);
+                fsr_diagnostic("fsr_async_init_ready");
+            }
+        }
+        if(impl_->prepared(inputs))return S_OK;
+        if(GetTickCount64()<initialization_retry_after_)return DXGI_ERROR_WAS_STILL_DRAWING;
+        // The caller drains submitted work before reset/reconfiguration. Never
+        // replace a live context here while its commands could still execute.
+        if(std::any_of(impl_->eyes.begin(),impl_->eyes.end(),[](const auto& eye){return eye.context!=nullptr;}))
+            return E_INVALIDARG;
+        auto pending=std::make_unique<Impl>();pending->device=impl_->device;
+        pending->array_description=impl_->array_description;pending->color_format=impl_->color_format;
+        std::array<D3D12FsrEyeInput,kMaximumEyes> copied{};
+        std::copy(inputs.begin(),inputs.end(),copied.begin());
+        // Only immutable resource descriptors are read by the worker. Keep COM
+        // objects alive, without pinning temporal snapshot slots or reading GPU data.
+        std::array<ComPtr<ID3D12Resource>,kMaximumEyes*3> resources;
+        for(size_t i=0;i<inputs.size();++i) {
+            resources[i*3]=inputs[i].color;resources[i*3+1]=inputs[i].depth;resources[i*3+2]=inputs[i].motion_vectors;
+        }
+        const auto count=inputs.size();
+        initialization_generation_=configuration_generation_;
+        initialization_=std::async(std::launch::async,
+            [pending=std::move(pending),copied,resources=std::move(resources),count]() mutable {
+                const std::span<const D3D12FsrEyeInput> in(copied.data(),count);
+                HRESULT result=pending->load_runtime(std::all_of(in.begin(),in.end(),
+                    [](const auto& input){return input.camera_data_valid;}));
+                if(SUCCEEDED(result))result=pending->select_color_domain(in);
+                if(SUCCEEDED(result))result=pending->ensure_array(in);
+                const bool shared=shared_stereo_slice(in);
+                for(size_t i=0;SUCCEEDED(result)&&i<count;++i) {
+                    const auto index=shared?i:in[i].output_slice;
+                    result=pending->ensure_eye(pending->eyes[index],in[i],index);
+                }
+                return std::make_pair(result,std::move(pending));
+            });
+        fsr_diagnostic("fsr_async_init_started",count);
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+    } catch(...) {
+        initialization_retry_after_=GetTickCount64()+5000;
+        return E_FAIL;
     }
 }
 
@@ -631,7 +824,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
     if (!impl_ || !commands || !generated_array || inputs.empty() ||
         inputs.size() > kMaximumEyes) return E_INVALIDARG;
     *generated_array = nullptr;
-    HRESULT result = impl_->load_runtime();
+    HRESULT result = prepare(inputs);
     if (FAILED(result)) {
         report_fsr_frame_generation_attempt(false);
         return result;
@@ -642,6 +835,11 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
             FsrFrameGenerationStatus::waiting_for_guides);
         report_fsr_frame_generation_attempt(false);
         return result;
+    }
+    if(std::any_of(inputs.begin(),inputs.end(),[](const auto& input){return input.fsr_upscale_source;}) &&
+        impl_->color_format!=DXGI_FORMAT_R8G8B8A8_UNORM && impl_->color_format!=DXGI_FORMAT_B8G8R8A8_UNORM) {
+        fsr_diagnostic("fsr_native_hdr_unsupported",impl_->color_format);
+        return E_NOTIMPL; // The inherited dispatch declares the sRGB transfer function.
     }
     result = impl_->ensure_array(inputs);
     if (FAILED(result)) {
@@ -724,26 +922,10 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
 bool D3D12FsrFrameGenerator::requires_idle_reconfigure(
     std::span<const D3D12FsrEyeInput> inputs) const noexcept {
     if (!impl_ || inputs.empty() || inputs.size() > kMaximumEyes) return false;
-    const bool shared_slice = shared_stereo_slice(inputs);
-    D3D12_RESOURCE_DESC required_array{};
-    if (!fsr_generated_array_description(
-            impl_->array_description, inputs, &required_array)) {
-        return false;
-    }
-    if (impl_->generated_array &&
-        (impl_->generated_array->GetDesc().Width != required_array.Width ||
-         impl_->generated_array->GetDesc().Height != required_array.Height ||
-         impl_->generated_array->GetDesc().DepthOrArraySize !=
-             required_array.DepthOrArraySize)) {
-        return true;
-    }
-    for (std::size_t eye_index = 0; eye_index < inputs.size(); ++eye_index) {
-        const auto context_index = shared_slice
-            ? eye_index : inputs[eye_index].output_slice;
-        if (context_index >= kMaximumEyes) return false;
-        if (Impl::needs_recreate(impl_->eyes[context_index], inputs[eye_index]))
-            return true;
-    }
+    // A worker owns cold contexts until adoption; there is no submitted work
+    // to drain while initialization is pending.
+    if(std::none_of(impl_->eyes.begin(),impl_->eyes.end(),[](const auto& eye){return eye.context!=nullptr;}))return false;
+    if(!impl_->prepared(inputs))return true;
     return false;
 }
 

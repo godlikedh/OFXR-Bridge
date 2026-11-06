@@ -5599,6 +5599,7 @@ void test_djules_extra_output(D3D12WarpFixture& fixture) {
 }  // namespace
 
 #include "r19_upstream_camera.inc"
+#include "fsr_warp_tests.inc"
 #include "hybrid_gpu.inc"
 
 #include "history_v474_wait_tests.inc"
@@ -5697,6 +5698,13 @@ int main(int argc, char** argv) {
                 test_hybrid_motion_vector_occlusion_edges(hybrid_fixture,scene,true,true);
             }
             hybrid_fixture.require_no_debug_errors();return 0;
+        }
+        if (argc>1 && std::string_view(argv[1])=="fsr-warp") {
+            D3D12WarpFixture fixture;
+            test_fsr_provider_stereo(fixture);
+            test_synthetic_camera_follows_display_pose(fixture,SyntheticCameraPath::fsr,false);
+            fixture.require_no_debug_errors();
+            return 0;
         }
         if (argc>1 && std::string_view(argv[1])=="r19-camera") {
             D3D12WarpFixture camera_fixture(true);

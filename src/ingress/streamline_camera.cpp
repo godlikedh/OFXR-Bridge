@@ -1,5 +1,6 @@
 #include "xrfg/native_ingress/streamline_camera.hpp"
 #include "xrfg/native_ingress/DeadSpaceCameraSource.h"
+#include "xrfg/d3d12_native_binding.hpp"
 #include <sl.h>
 #include "xrfg/native_ingress/streamline1/sl1.h"
 #include <safetyhook.hpp>
@@ -7,13 +8,26 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <atomic>
 namespace xrfg::native_ingress::streamline_camera {
 namespace {
+using Microsoft::WRL::ComPtr;
+struct TaggedCamera {
+    ComPtr<IUnknown> list, depth, motion;
+    sl::Extent depth_rect{}, motion_rect{};
+    uint32_t frame{}, viewport{};
+    bool used{};
+};
 struct Hooks {
     std::mutex mutex;
     std::array<Camera,16> cameras{};
     std::size_t cursor{};
-    SafetyHookInline constants,evaluate;
+    SafetyHookInline constants,evaluate,tags;
+    PFun_slSetTagForFrame* tag{};
+    std::array<TaggedCamera,32> tagged{};
+    std::size_t tag_cursor{};
+    bool fsr_enabled{};
+    FsrCameraStatistics stats{};
     PFun_slSetConstants* set{};
     PFun_slEvaluateFeature* eval{};
     // Exact declarations from NVIDIA Streamline 1.3, retained by shared OptiScaler.
@@ -24,6 +38,7 @@ struct Hooks {
 };
 Hooks& hooks(){static auto* value=new Hooks;return *value;}
 thread_local Camera production;
+std::atomic_bool fsr_tags_enabled{};
 template<std::size_t N> bool finite(const std::array<float,N>& values) {
     for(float v:values)if(!std::isfinite(v))return false;
     return true;
@@ -59,16 +74,58 @@ template<class Constants> Camera decode(const Constants& v,uint32_t frame,uint32
 }
 void remember(const Camera& c) {
     auto& s=hooks();std::scoped_lock lock(s.mutex);
+    ++s.stats.constants;
     auto it=std::find_if(s.cameras.begin(),s.cameras.end(),[&](const auto& entry){
-        return entry.valid&&entry.frame==c.frame&&entry.viewport==c.viewport;});
+        return entry.observed&&entry.frame==c.frame&&entry.viewport==c.viewport;});
     if(it==s.cameras.end())it=s.cameras.begin()+(s.cursor++%s.cameras.size());
     *it=c;
 }
+ComPtr<IUnknown> identity(IUnknown* value) {
+    IUnknown* native{};ComPtr<IUnknown> result;
+    if(value&&d3d_native::get_borrowed(value,&native))native->QueryInterface(IID_PPV_ARGS(&result));
+    return result;
+}
+sl::Result tag_for_frame(const sl::FrameToken& frame,const sl::ViewportHandle& viewport,
+    const sl::ResourceTag* tags,uint32_t count,sl::CommandBuffer* buffer) {
+    const auto result=hooks().tag(frame,viewport,tags,count,buffer);
+    try {
+        auto& s=hooks();std::scoped_lock lock(s.mutex);
+        if(!s.fsr_enabled)return result;
+        ++s.stats.tags;
+        const auto f=uint32_t(frame),v=uint32_t(viewport);
+        // Failed/null/volatile retags invalidate this viewport's old receipt.
+        for(auto& t:s.tagged)if(t.viewport==v&&t.frame!=f)t={};
+        if(result!=sl::Result::eOk||!buffer||!tags||count>64) {
+            for(auto& t:s.tagged)if(t.viewport==v)t={};return result;
+        }
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if(FAILED(reinterpret_cast<IUnknown*>(buffer)->QueryInterface(IID_PPV_ARGS(&list))))return result;
+        const auto key=identity(list.Get());if(!key)return result;
+        auto it=std::find_if(s.tagged.begin(),s.tagged.end(),[&](const auto& t){
+            return t.list==key&&t.frame==f&&t.viewport==v;});
+        if(it==s.tagged.end()) {it=s.tagged.begin()+(s.tag_cursor++%s.tagged.size());*it={};it->list=key;it->frame=f;it->viewport=v;}
+        // A consumed frame cannot be resurrected by retagging recycled textures.
+        if(it->used)return result;
+        for(uint32_t i=0;i<count;++i) {
+            const auto& t=tags[i];
+            if(t.type!=sl::kBufferTypeDepth&&t.type!=sl::kBufferTypeMotionVectors)continue;
+            ComPtr<IUnknown> resource;
+            if(t.resource&&t.resource->native&&t.resource->type==sl::ResourceType::eTex2d&&
+                (t.lifecycle==sl::ResourceLifecycle::eValidUntilPresent||t.lifecycle==sl::ResourceLifecycle::eValidUntilEvaluate)) {
+                ComPtr<ID3D12Resource> r;
+                if(SUCCEEDED(reinterpret_cast<IUnknown*>(t.resource->native)->QueryInterface(IID_PPV_ARGS(&r))))resource=identity(r.Get());
+            }
+            if(t.type==sl::kBufferTypeDepth){it->depth=resource;it->depth_rect=t.extent;}
+            else{it->motion=resource;it->motion_rect=t.extent;}
+        }
+    }catch(...) {}
+    return result;
+}
 sl::Result set_constants(const sl::Constants& v,const sl::FrameToken& frame,
     const sl::ViewportHandle& viewport) {
-    const auto c=decode(v,static_cast<uint32_t>(frame),static_cast<uint32_t>(viewport));
+    auto c=decode(v,static_cast<uint32_t>(frame),static_cast<uint32_t>(viewport));
     const auto result=hooks().set(v,frame,viewport);
-    if(result==sl::Result::eOk)remember(c);
+    if(result!=sl::Result::eOk){c.valid=false;c.rejection|=512;}remember(c);
     return result;
 }
 bool set_constants1(const sl1::Constants& v,uint32_t frame,uint32_t viewport) {
@@ -152,6 +209,40 @@ unsigned major_version(HMODULE module) {
 Camera current(bool luke_projection_receipt) noexcept {
     auto camera=production;if(luke_projection_receipt)static_cast<void>(projection_fov(camera));return camera;
 }
+void enable_fsr_tags(bool enabled) noexcept {
+    auto& s=hooks();std::scoped_lock lock(s.mutex);
+    if(s.fsr_enabled!=enabled)s.tagged={};s.fsr_enabled=enabled;fsr_tags_enabled.store(enabled,std::memory_order_relaxed);
+}
+void retire_fsr_tags(ID3D12GraphicsCommandList* list) noexcept {
+    if(!fsr_tags_enabled.load(std::memory_order_relaxed))return;
+    try {const auto key=identity(list);auto& s=hooks();std::scoped_lock lock(s.mutex);
+        for(auto& t:s.tagged)if(t.list==key)t={};
+    }catch(...) {}
+}
+Camera take_fsr_camera(ID3D12GraphicsCommandList* list,ID3D12Resource* depth,
+    ID3D12Resource* motion,unsigned dw,unsigned dh,unsigned mw,unsigned mh) noexcept {
+    try {
+        const auto l=identity(list),d=identity(depth),m=identity(motion);
+        auto& s=hooks();std::scoped_lock lock(s.mutex);Camera result{};
+        if(!s.fsr_enabled||!l||!d||!m)return result;
+        const auto fits=[](const sl::Extent& r,unsigned w,unsigned h,ID3D12Resource* resource) {
+            if(r.left||r.top)return false;
+            if(r.width||r.height)return r.width==w&&r.height==h;
+            const auto desc=resource->GetDesc();return desc.Width==w&&desc.Height==h&&desc.DepthOrArraySize==1;
+        };
+        unsigned matches{};
+        for(auto& t:s.tagged)if(!t.used&&t.list==l&&t.depth==d&&t.motion==m&&
+            fits(t.depth_rect,dw,dh,depth)&&fits(t.motion_rect,mw,mh,motion)) {
+            ++matches;t.used=true;
+            for(const auto& c:s.cameras)if(c.observed&&c.frame==t.frame&&c.viewport==t.viewport)result=c;
+        }
+        if(matches!=1||!result.valid){++s.stats.rejected;return {};}
+        ++s.stats.matched;return result;
+    }catch(...) {return {};}
+}
+FsrCameraStatistics fsr_statistics() noexcept {
+    auto& s=hooks();std::scoped_lock lock(s.mutex);return s.stats;
+}
 bool hooked() noexcept {auto& s=hooks();std::scoped_lock lock(s.mutex);return bool(s.constants)&&bool(s.evaluate);}
 void poll() noexcept {
     dead_space_camera_source::poll();
@@ -174,6 +265,10 @@ void poll() noexcept {
         HMODULE pinned{};
         if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(c),&pinned)){s.constants={};s.evaluate={};return;}
+        if(!legacy)if(const auto entry=GetProcAddress(module,"slSetTagForFrame")) {
+            s.tags=safetyhook::create_inline(entry,reinterpret_cast<void*>(&tag_for_frame),SafetyHookInline::StartDisabled);
+            if(s.tags){s.tag=s.tags.original<PFun_slSetTagForFrame*>();if(!s.tags.enable()){s.tags={};s.tag=nullptr;}}
+        }
         const auto constants=s.constants.enable();const auto evaluation=s.evaluate.enable();
         if(!constants||!evaluation){s.constants={};s.evaluate={};}
     }catch(...) {}

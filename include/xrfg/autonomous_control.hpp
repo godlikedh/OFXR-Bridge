@@ -178,6 +178,27 @@ struct Snapshot {
     BenchmarkStatus benchmark{};
 };
 
+enum class DiagnosticsPhase : unsigned { idle, queued, running, complete, failed };
+struct DiagnosticsStatus {
+    DiagnosticsPhase phase{};
+    bool available{};
+    unsigned controller_pid{}, issues{};
+    std::uint64_t heartbeat_ms{}, request_id{};
+    char zip_path[2048]{}, message[512]{}; // UTF-8, transient; never saved to settings
+};
+inline bool diagnostics_active(const DiagnosticsStatus& value) noexcept {
+    return value.phase == DiagnosticsPhase::queued || value.phase == DiagnosticsPhase::running;
+}
+// Global-profile mailbox, shared across desktop/game profiles and VR sessions.
+// UI operations acquire the IPC lock without waiting and never launch a process.
+DiagnosticsStatus diagnostics_snapshot() noexcept;
+bool request_diagnostics() noexcept;
+// Launch the installed companion tool on a worker thread; never run collection in the game.
+bool launch_provider_tools(bool collect) noexcept;
+// Tray only: heartbeat, recover an exited controller, and claim at most one request.
+DiagnosticsStatus take_diagnostics_request(bool available) noexcept;
+bool report_diagnostics(const DiagnosticsStatus& result) noexcept;
+
 // Once per trial, captured in the game process on its rendering adapter.
 // Unknown/unsupported reads stay invalid, never zero-filled measurements.
 struct BenchmarkMemory {

@@ -44,6 +44,7 @@
 #include "optiscaler_bootstrap.hpp"
 #include "xrfg/presentation_transform.h"
 #include "xrfg/fsr_frame_generation.hpp"
+#include "xrfg/input_providers.hpp"
 #include "xrfg/provider_api.hpp"
 #include "xrfg/two_frame_capture.hpp"
 #include "xrfg/luke_host_config.hpp"
@@ -5427,6 +5428,7 @@ XrResult layer_create_api_layer_instance_impl(
 
     if(!xrfg::autonomous::initialize_game_configuration())return XR_ERROR_INITIALIZATION_FAILED;
     xrfg::autonomous::apply_runtime_settings();
+    xrfg::prepare_input_providers(current_layer_directory().c_str());
     xrfg::prepare_ngx_feature_discovery(current_layer_directory().c_str());
     XrInstance created_instance = XR_NULL_HANDLE;
     const XrResult result = next_create_api_layer_instance(
@@ -10897,7 +10899,8 @@ void refresh_side_by_side_projection_guides(
     SessionState& session, const ProjectionSnapshot& snapshot,
     const ProjectionResourceMapping& mapping) noexcept {
     const auto chain = find_swapchain(mapping.application_swapchain);
-    if (!chain || chain->create_info.arraySize != 1) return;
+    if (!chain || (chain->create_info.arraySize != 1 &&
+        !(strict_fsr_release_guides(session)&&chain->create_info.arraySize==2))) return;
     std::array<xrfg::DlssEyeView, 2> views{};
     std::array<std::size_t, 2> local_of_eye{2, 2};
     for (std::size_t local = 0; local < mapping.views.size(); ++local) {
@@ -10912,7 +10915,9 @@ void refresh_side_by_side_projection_guides(
             std::tan(fov.angleUp), std::tan(fov.angleDown), rect.offset.x, rect.offset.y,
             static_cast<std::uint32_t>(std::max(rect.extent.width, 0)),
             static_cast<std::uint32_t>(std::max(rect.extent.height, 0))};
-        local_of_eye[reference.view_index] = local;
+        const std::size_t guide_slot=chain->create_info.arraySize==2?view.subImage.imageArrayIndex:local;
+        if(guide_slot>=2||local_of_eye[1-reference.view_index]==guide_slot)return;
+        local_of_eye[reference.view_index] = guide_slot;
     }
     std::uint64_t release = 0;
     bool by_size = false;
@@ -10929,12 +10934,12 @@ void refresh_side_by_side_projection_guides(
     }
     int outcome = by_size ? 0 : 2;
     std::shared_ptr<xrfg::DlssMotionVectorSet> placed_set;
-    // Not on the FSR route, which reads whole texels.
-    if (!by_size && release != 0 && !strict_fsr_release_guides(session)) {
-        auto placed = xrfg::resolve_view_placed_dlss_guides(
-            session.d3d12_queue.Get(), views, {release, release});
+    if (!by_size && release != 0) {
+        auto placed = strict_fsr_release_guides(session)
+            ? xrfg::resolve_fsr_foveated_guides(session.d3d12_queue.Get(),views,{release,release})
+            : xrfg::resolve_view_placed_dlss_guides(session.d3d12_queue.Get(), views, {release, release});
         outcome = 1;
-        if (!placed[0] || !placed[1]) {
+        if ((!placed[0] || !placed[1])&&!strict_fsr_release_guides(session)) {
             placed = xrfg::resolve_enlarged_dlss_guides(session.d3d12_queue.Get(), views, release);
             outcome = 3;
         }
@@ -11054,15 +11059,15 @@ void refresh_release_bound_projection_guides(
         // field at FoveatedRenderingScale of its pixels and an inset - and
         // composites them into the eye images itself. Each eye then takes the
         // stream whose camera (Streamline's constants) covers its field,
-        // placed scaled (0.2's V515). Not on the FSR route, which reads whole
-        // texels. 753 per eye for the first frames and every 512th after: a
+        // placed scaled (0.2's V515). Native FSR instead requires the exact
+        // validated stereo/quad camera join and GPU guide conversion. 753 per eye: a
         // the eye << 32 | the stream's low bits, b the vector rectangle placed
         // on the view (x, y, width, height, each in eighths of a texel, 16
         // bits), c the publication. 755 for the first eight frames none fit:
         // a 0, b and c the eyes' fields (four tangents, 4096ths, 16 bits).
         bool by_view = false;
         if (chains[0] && chains[1] && (!resolved[0] || !resolved[1]) &&
-            !strict_fsr_release_guides(session) && releases[0] != 0 && releases[1] != 0 &&
+            releases[0] != 0 && releases[1] != 0 &&
             fovs[0] && fovs[1]) {
             std::array<xrfg::DlssEyeView, 2> views{};
             for (std::size_t eye = 0; eye < views.size(); ++eye) {
@@ -11072,8 +11077,9 @@ void refresh_release_bound_projection_guides(
                     static_cast<std::uint32_t>(rects[eye].extent.width),
                     static_cast<std::uint32_t>(rects[eye].extent.height)};
             }
-            auto placed = xrfg::resolve_view_placed_dlss_guides(
-                session.d3d12_queue.Get(), views, {releases[0], releases[1]});
+            auto placed = strict_fsr_release_guides(session)
+                ? xrfg::resolve_fsr_foveated_guides(session.d3d12_queue.Get(),views,{releases[0],releases[1]})
+                : xrfg::resolve_view_placed_dlss_guides(session.d3d12_queue.Get(), views, {releases[0], releases[1]});
             if (placed[0] && placed[1]) {
                 resolved = std::move(placed);
                 by_view = true;
@@ -11128,6 +11134,30 @@ void refresh_release_bound_projection_guides(
     } catch (...) {
         reject();
     }
+}
+
+void report_provider_projection_images(const ProjectionSnapshot& snapshot,const ProjectionMappingResult& mappings) noexcept {
+    if(!mappings.ready())return;
+    try {
+        for(const auto& mapping:mappings.mappings) {
+            const auto chain=find_swapchain(mapping.application_swapchain);if(!chain)continue;
+            std::scoped_lock lock(chain->mutex);
+            const auto released=chain->last_released_index;
+            if(!released||*released>=chain->enumerated_d3d12_images.size())continue;
+            for(const auto& ref:mapping.views) {
+                if(ref.projection_index>=snapshot.layers.size()||ref.view_index>=snapshot.layers[ref.projection_index].views.size())continue;
+                const auto& view=snapshot.layers[ref.projection_index].views[ref.view_index];
+                const auto& rect=view.subImage.imageRect;
+                OFXR_ProjectionReceiptV1 receipt{};
+                receipt.color=chain->enumerated_d3d12_images[*released].Get();
+                receipt.swapchain=handle_value(chain->handle);receipt.eye=(UINT64(ref.projection_index)<<32)|ref.view_index;
+                receipt.display_time=UINT64(snapshot.display_time);receipt.slice=view.subImage.imageArrayIndex;
+                receipt.publication=chain->release_publication;receipt.x=rect.offset.x;receipt.y=rect.offset.y;
+                receipt.width=unsigned(std::max(rect.extent.width,0));receipt.height=unsigned(std::max(rect.extent.height,0));
+                xrfg::report_provider_projection(receipt);
+            }
+        }
+    }catch(...) {}
 }
 
 [[nodiscard]] ProjectionMappingResult
@@ -16730,6 +16760,7 @@ XrResult layer_end_frame_impl(
         log_projection_view_rects(*state, current_snapshot);
         if (!state->luke_afw_enabled) note_projection_eyes(current_snapshot, resource_mappings);
         refresh_release_bound_projection_guides(*state, current_snapshot, resource_mappings);
+        report_provider_projection_images(current_snapshot,resource_mappings);
     } else {
         resource_mappings.reason = ProjectionMappingReason::no_projection_views;
     }
@@ -16801,6 +16832,33 @@ XrResult layer_end_frame_impl(
         const bool admitted = admission.observe(stereo_projection
             ? classify_fsr_stereo_guides(current_snapshot, projection_mappings)
             : FsrStereoGuideReason::non_stereo_projection);
+        static std::atomic<ULONGLONG> last_fsr_admission_log{};
+        const auto fsr_now=GetTickCount64();
+        if(fsr_now-last_fsr_admission_log.load(std::memory_order_relaxed)>=1000) {
+            last_fsr_admission_log.store(fsr_now,std::memory_order_relaxed);
+            xrfg::fsr_diagnostic("fsr_stereo_admission",static_cast<UINT64>(admission.reason),
+                projection_mappings.size(),current_snapshot.layers.size(),admitted);
+            for(const auto& mapping:projection_mappings) {
+                const auto chain=find_swapchain(mapping.application_swapchain);if(!chain)continue;
+                std::scoped_lock lock(chain->mutex);
+                const auto& guides=chain->last_released_motion_vectors;
+                for(std::size_t local=0;local<mapping.views.size();++local) {
+                    const auto& ref=mapping.views[local];const auto& view=current_snapshot.layers[ref.projection_index].views[ref.view_index];
+                    const auto eye_key=(UINT64(ref.projection_index)<<32)|ref.view_index;
+                    const auto index=chain->create_info.arraySize==1&&guides&&guides->eye_count==mapping.views.size()
+                        ?std::uint32_t(local):view.subImage.imageArrayIndex;
+                    const auto* guide=guides&&index<guides->eye_count&&index<guides->eyes.size()?guides->eyes[index].get():nullptr;
+                    const auto released=chain->last_released_index;
+                    const auto* color=released&&*released<chain->enumerated_d3d12_images.size()?chain->enumerated_d3d12_images[*released].Get():nullptr;
+                    xrfg::fsr_diagnostic("fsr_stereo_binding",eye_key,handle_value(chain->handle),view.subImage.imageArrayIndex,chain->release_publication);
+                    xrfg::fsr_diagnostic("fsr_stereo_color",eye_key,reinterpret_cast<UINT64>(color),released?*released:UINT64_MAX,
+                        guide?reinterpret_cast<UINT64>(guide->output.Get()):0);
+                    xrfg::fsr_diagnostic("fsr_stereo_guide",eye_key,guide?guide->stream:0,guide?guide->epoch:0,guide?guide->serial:0);
+                    xrfg::fsr_diagnostic("fsr_stereo_previous",eye_key,guide?guide->previous_serial:0,guide?guide->publication:0,
+                        guide&&guide->camera_frame_token_valid?guide->camera_frame_token:UINT64_MAX);
+                }
+            }
+        }
         if (admission.reason != previous_reason)
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::fsr_recovery,
                 static_cast<std::int64_t>(admission.reason), 300,

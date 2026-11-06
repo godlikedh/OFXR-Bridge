@@ -5,6 +5,8 @@
 #include "xrfg/luke_motion_format.hpp"
 #include "xrfg/two_frame_capture.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
+#include "xrfg/fsr_foveation.hpp"
+#include "xrfg/fsr_frame_generation.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +39,7 @@ struct SnapshotSlot {
     ComPtr<ID3D12Resource> resource;
     ComPtr<ID3D12Device> allocation_device;
     D3D12_RESOURCE_DESC description{};
+    std::uint64_t allocation_bytes{};
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
     std::shared_ptr<DlssSnapshotRetention> retention;
     // Recording a copy is not submission. The original Execute callback
@@ -215,6 +218,21 @@ bool interleaved_frames(const DlssMotionVectorFrame& current,
         same_identity(current.producer_queue.Get(), older->producer_queue.Get());
 }
 
+std::optional<D3D12_RESOURCE_DESC> depth_snapshot_description(D3D12_RESOURCE_DESC description,
+    std::optional<std::uint32_t> subresource) noexcept {
+    if (!subresource) return description;
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.SampleDesc.Count != 1 ||
+        !description.MipLevels || description.MipLevels > 32 || !description.DepthOrArraySize ||
+        *subresource >= std::uint32_t(description.MipLevels) * description.DepthOrArraySize ||
+        (description.Format != DXGI_FORMAT_R32_FLOAT && description.Format != DXGI_FORMAT_R32_TYPELESS) ||
+        (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return {};
+    const auto mip = *subresource % description.MipLevels;
+    description.Width = std::max<UINT64>(1, description.Width >> mip);
+    description.Height = std::max<UINT>(1, description.Height >> mip);
+    description.MipLevels = description.DepthOrArraySize = 1;
+    return description;
+}
+
 bool valid(const DlssMotionVectorPublication& publication) noexcept {
     if (publication.stream == 0 || publication.output == nullptr ||
         publication.motion_vectors == nullptr ||
@@ -238,8 +256,11 @@ bool valid(const DlssMotionVectorPublication& publication) noexcept {
             motion.Width &&
         static_cast<std::uint64_t>(publication.motion_y) + publication.motion_height <=
             motion.Height;
-    if (!base_valid || publication.depth == nullptr) return base_valid;
-    const auto depth = publication.depth->GetDesc();
+    if (!base_valid || publication.depth == nullptr) return base_valid && !publication.depth_source_subresource;
+    if (publication.depth_source_subresource && (!publication.fsr_upscale_source || !publication.direct_output_receipt)) return false;
+    const auto selected = depth_snapshot_description(publication.depth->GetDesc(), publication.depth_source_subresource);
+    if (!selected) return false;
+    const auto depth = *selected;
     return depth.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         publication.depth_width != 0 && publication.depth_height != 0 &&
         static_cast<std::uint64_t>(publication.depth_x) + publication.depth_width <=
@@ -291,7 +312,9 @@ HRESULT snapshot_resource(
     std::shared_ptr<DlssSnapshotRetention>* retention = nullptr,
     ComPtr<ID3D12Device>* allocation_receipt = nullptr,
     std::size_t retained_capacity = SnapshotCount,
-    bool dlss_float_motion = false) noexcept {
+    bool dlss_float_motion = false,
+    std::optional<std::uint32_t> source_subresource = {},
+    bool reuse_existing = false) noexcept {
     if (source == nullptr || producer_command_list == nullptr ||
         producer_queue == nullptr || snapshot == nullptr) return E_POINTER;
     snapshot->Reset();
@@ -327,6 +350,11 @@ HRESULT snapshot_resource(
     }
 
     D3D12_RESOURCE_DESC description = source->GetDesc();
+    if (source_subresource) {
+        const auto selected = depth_snapshot_description(description, source_subresource);
+        if (!selected) return E_INVALIDARG;
+        description = *selected;
+    }
     // The observed NGX SR/RR MotionVectors input has the documented float-XY
     // contract. Dead Space allocates that field as RG16_TYPELESS. Preserve its
     // bits in the existing owned copy using the compatible RG16_FLOAT format;
@@ -342,7 +370,23 @@ HRESULT snapshot_resource(
     // No producer wait/flush is introduced at recording time.
     const std::size_t capacity = retention ? std::min(retained_capacity,SnapshotCount) : 4;
     std::size_t selected = capacity;
-    for (std::size_t offset = 0; offset < capacity; ++offset) {
+    // Native FSR has explicit CPU pins and GPU writer/reader receipts. Prefer
+    // an already allocated compatible slot instead of filling the entire
+    // sixteen-slot capacity during normal play. Keep the full capacity for
+    // real overlap; unprotected legacy rings retain their rotation policy.
+    if (reuse_existing && retention) {
+        for (std::size_t offset = 0; offset < capacity; ++offset) {
+            const auto index = (next_snapshot + offset) % capacity;
+            const auto& slot = snapshots[index];
+            const auto& use = slot.retention;
+            if (slot.resource && matching_description(slot.description, description) &&
+                writer_complete(slot) && (!use || (use.use_count() == 1 && use->reusable())) &&
+                same_identity(slot.allocation_device.Get(), allocation_device.Get())) {
+                selected = index; break;
+            }
+        }
+    }
+    for (std::size_t offset = 0; selected == capacity && offset < capacity; ++offset) {
         const auto index = (next_snapshot + offset) % capacity;
         const auto& use = snapshots[index].retention;
         if (writer_complete(snapshots[index]) &&
@@ -375,6 +419,7 @@ HRESULT snapshot_resource(
         slot.resource = std::move(resource);
         slot.allocation_device = allocation_device;
         slot.description = description;
+        slot.allocation_bytes = allocation_device->GetResourceAllocationInfo(0, 1, &description).SizeInBytes;
         slot.state = D3D12_RESOURCE_STATE_COMMON;
     }
 
@@ -385,6 +430,7 @@ HRESULT snapshot_resource(
             source,
             source_state,
             D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (source_subresource) before[before_count-1].Transition.Subresource = *source_subresource;
     }
     if (slot.state != D3D12_RESOURCE_STATE_COPY_DEST) {
         before[before_count++] = transition_barrier(
@@ -393,7 +439,12 @@ HRESULT snapshot_resource(
     if (before_count != 0) {
         producer_command_list->ResourceBarrier(before_count, before.data());
     }
-    producer_command_list->CopyResource(slot.resource.Get(), source);
+    if (source_subresource) {
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource = source; from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; from.SubresourceIndex = *source_subresource;
+        to.pResource = slot.resource.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        producer_command_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    } else producer_command_list->CopyResource(slot.resource.Get(), source);
 
     std::array<D3D12_RESOURCE_BARRIER, 2> after{};
     UINT after_count = 0;
@@ -402,6 +453,7 @@ HRESULT snapshot_resource(
             source,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             source_state);
+        if (source_subresource) after[after_count-1].Transition.Subresource = *source_subresource;
     }
     after[after_count++] = transition_barrier(
         slot.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, snapshot_state);
@@ -596,14 +648,24 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
         ComPtr<ID3D12Device> motion_snapshot_device, depth_snapshot_device;
         std::shared_ptr<DlssSnapshotRetention> motion_retention, depth_retention;
         const bool retain_snapshots=publication.protect_snapshot_lifetime || publication.direct_output_receipt;
-        const std::size_t retained_capacity=publication.direct_output_receipt ? 6 : kSnapshotSlotCount;
-        if (FAILED(snapshot_resource(stream.snapshots, stream.next_snapshot,
+        // FSR also has three consumer work slots, a retained previous color
+        // and independent left/right release owners. Six allocations can all
+        // remain legitimately pinned even after the GPU finishes, preventing
+        // the next pair that would advance those owners. Use the bounded
+        // sixteen-slot pool; CPU pins and actual fences still govern reuse.
+        const std::size_t retained_capacity=kSnapshotSlotCount;
+        const auto motion_result=snapshot_resource(stream.snapshots, stream.next_snapshot,
                 publication.motion_vectors, publication.resource_state,
                 publication.producer_command_list, publication.producer_queue,
                 publication.verified_producer_device,
                 &motion_snapshot, kSnapshotReadState,
                 retain_snapshots ? &motion_retention : nullptr,
-                &motion_snapshot_device,retained_capacity,publication.dlss_float_motion))) {
+                &motion_snapshot_device,retained_capacity,publication.dlss_float_motion,{},publication.fsr_upscale_source);
+        if (FAILED(motion_result)) {
+            static std::atomic_uint64_t failures{};
+            const auto count=++failures;
+            if(publication.fsr_upscale_source && (count<=8 || count%240==0))
+                fsr_diagnostic("fsr_snapshot_failed",publication.stream,static_cast<UINT>(motion_result),0,count);
             ++state.statistics.snapshot_failures;
             state.statistics.status = DlssMotionVectorStatus::invalid_input;
             return {};
@@ -612,14 +674,19 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
 
         ComPtr<ID3D12Resource> depth_snapshot;
         if (publication.depth != nullptr) {
-            if (FAILED(snapshot_resource(stream.depth_snapshots,
+            const auto depth_result=snapshot_resource(stream.depth_snapshots,
                     stream.next_depth_snapshot, publication.depth,
                     publication.depth_resource_state,
                     publication.producer_command_list,
                     publication.producer_queue,
                     publication.verified_producer_device, &depth_snapshot, kSnapshotReadState,
                     retain_snapshots ? &depth_retention : nullptr,
-                    &depth_snapshot_device,retained_capacity))) {
+                    &depth_snapshot_device,retained_capacity,false,publication.depth_source_subresource,publication.fsr_upscale_source);
+            if (FAILED(depth_result)) {
+                static std::atomic_uint64_t failures{};
+                const auto count=++failures;
+                if(publication.fsr_upscale_source && (count<=8 || count%240==0))
+                    fsr_diagnostic("fsr_snapshot_failed",publication.stream,static_cast<UINT>(depth_result),1,count);
                 ++state.statistics.snapshot_failures;
                 state.statistics.status = DlssMotionVectorStatus::invalid_input;
                 return {};
@@ -696,6 +763,9 @@ std::shared_ptr<const DlssMotionVectorFrame> publish_dlss_motion_vectors(
         frame->camera_right = publication.camera_right;
         frame->camera_forward = publication.camera_forward;
         frame->camera_fov_vertical = publication.camera_fov_vertical;
+        frame->fsr_upscale_source = publication.fsr_upscale_source;
+        frame->source_view_mask = publication.source_view_mask;
+        frame->view_space_to_meters = publication.view_space_to_meters;
         frame->camera_data_valid = publication.camera_data_valid;
         frame->camera_view_to_clip = publication.camera_view_to_clip;
         frame->camera_clip_to_view = publication.camera_clip_to_view;
@@ -848,6 +918,29 @@ void configure_dlss_motion_vector_tracking(bool enabled) noexcept {
     }
 }
 
+DlssSnapshotMemory dlss_snapshot_memory(std::uint64_t id) noexcept {
+    try {
+        auto& state = registry();
+        std::unique_lock lock(state.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return {};
+        DlssSnapshotMemory result{true};
+        const auto count = [&](const StreamState& stream, bool retired) {
+            const auto slots = [&](const auto& values) {
+                for (const auto& slot : values) if (slot.resource) {
+                    ++result.slots;
+                    if (retired) ++result.retired_slots;
+                    if (!slot.allocation_bytes || slot.allocation_bytes == UINT64_MAX) result.valid = false;
+                    else result.bytes += slot.allocation_bytes;
+                }
+            };
+            slots(stream.snapshots); slots(stream.depth_snapshots); slots(stream.output_snapshots);
+        };
+        for (const auto& [key, stream] : state.streams) if (!id || id == key) count(stream, false);
+        if (!id) for (const auto& stream : state.retired_streams) count(stream, true);
+        return result;
+    } catch (...) { return {}; }
+}
+
 void retire_disabled_dlss_motion_vector_resources() noexcept {
     if(!g_retirement_pending.load(std::memory_order_acquire))return;
     try {
@@ -898,6 +991,24 @@ void invalidate_dlss_motion_vector_stream_history(std::uint64_t stream_id) noexc
         state.statistics.status = DlssMotionVectorStatus::temporal_mismatch;
     } catch (...) {
     }
+}
+
+bool attach_fsr_scene_camera(std::uint64_t id,std::uint64_t publication,
+    const DlssCameraAttachment& camera,std::uint32_t token,bool matrices_valid,unsigned source_view_mask) noexcept {
+    try {
+        auto& s=registry();std::scoped_lock lock(s.mutex);auto it=s.streams.find(id);
+        if(it==s.streams.end())return false;
+        auto& latest=it->second.latest;
+        if(!latest||latest->publication!=publication||!latest->fsr_upscale_source||latest->camera_data_valid)return false;
+        auto next=std::make_shared<DlssMotionVectorFrame>(*latest);
+        next->camera_position=camera.position;next->camera_right=camera.right;
+        next->camera_up=camera.up;next->camera_forward=camera.forward;
+        next->camera_data_valid=true;next->camera_matrices_valid=matrices_valid;
+        if(matrices_valid) {next->camera_view_to_clip=camera.view_to_clip;next->camera_clip_to_view=camera.clip_to_view;}
+        next->camera_frame_token=token;next->camera_frame_token_valid=true;
+        next->source_view_mask=matrices_valid?source_view_mask:0;
+        latest=std::move(next);return true;
+    }catch(...) {return false;}
 }
 
 bool attach_dlss_motion_vector_camera(std::uint64_t stream_id, std::uint64_t publication,
@@ -1499,6 +1610,93 @@ resolve_view_placed_dlss_guides(
     }
 }
 
+std::array<std::shared_ptr<const DlssMotionVectorSet>,kDlssMotionVectorEyeCount>
+resolve_fsr_foveated_guides(ID3D12CommandQueue* queue,
+    const std::array<DlssEyeView,kDlssMotionVectorEyeCount>& views,
+    const std::array<std::uint64_t,kDlssMotionVectorEyeCount>& releases) noexcept {
+    decltype(resolve_fsr_foveated_guides(queue,views,releases)) none{};
+    try {
+        if(!queue||!releases[0]||!releases[1]||!g_tracking_enabled.load())return none;
+        auto& s=registry();std::scoped_lock lock(s.mutex);
+        std::vector<std::shared_ptr<const DlssMotionVectorFrame>> frames;
+        std::uint64_t newest{};std::uint32_t token{};
+        for(const auto& [id,stream]:s.streams) {
+            for(const auto& f:{stream.latest,stream.previous,stream.previous2}) {
+                if(!f||f->publication>std::max(releases[0],releases[1]))continue;
+                // Select the newest publication eligible for this release,
+                // then validate it. A newer unbound camera is a missing guide,
+                // not permission to reuse a prior frame's otherwise valid eye.
+                if(!f->fsr_upscale_source||!f->camera_data_valid||!f->camera_matrices_valid||
+                    !f->camera_frame_token_valid)break;
+                if(!f->depth||!f->motion_vectors||!f->producer_fence||!f->producer_fence_value||
+                    !same_device(f->producer_fence.Get(),queue))break;
+                frames.push_back(f);
+                if(f->publication>newest){newest=f->publication;token=f->camera_frame_token;}
+                break;
+            }
+        }
+        std::erase_if(frames,[&](const auto& f){return f->camera_frame_token!=token;});
+        const bool stereo=frames.size()==2 && std::all_of(frames.begin(),frames.end(),
+            [](const auto& f){return f->source_view_mask==3;});
+        if(!stereo && frames.size()!=4)return none; // incomplete quads cannot fall back to stereo
+        if(!stereo && std::any_of(frames.begin(),frames.end(),
+            [](const auto& f){return f->source_view_mask==3;}))return none;
+        const auto field=[](const auto& f){const auto g=dlss_view_geometry(f);
+            return fsr_foveation::Field{g.tan_left,g.tan_right,g.tan_up,g.tan_down};};
+        std::array<std::shared_ptr<const DlssMotionVectorFrame>,2> peripheral{};
+        unsigned count{};
+        for(const auto& f:frames) {
+            const auto from=field(*f);if(!fsr_foveation::valid(from))return none;
+            bool coverage{};
+            for(const auto& v:views) {
+                const fsr_foveation::Field to{v.tan_left,v.tan_right,v.tan_up,v.tan_down};
+                if(!fsr_foveation::valid(to))return none;
+                coverage|=fsr_foveation::covers(fsr_foveation::mapping(from,to));
+            }
+            if(coverage){if(count==2)return none;peripheral[count++]=f;}
+        }
+        if(count!=2)return none;
+        std::array<float,3> right{};
+        for(unsigned j=0;j<3;++j)right[j]=peripheral[0]->camera_right[j]+peripheral[1]->camera_right[j];
+        const double side0=camera_side(dlss_view_geometry(*peripheral[0]),right);
+        const double side1=camera_side(dlss_view_geometry(*peripheral[1]),right);
+        if(std::abs(side0-side1)<1e-7)return none;
+        if(side0>side1)std::swap(peripheral[0],peripheral[1]);
+        decltype(none) result{};
+        for(unsigned eye=0;eye<2;++eye) {
+            const auto& p=*peripheral[eye];const auto& v=views[eye];
+            const fsr_foveation::Field to{v.tan_left,v.tan_right,v.tan_up,v.tan_down};
+            if(p.publication>releases[eye]||!fsr_foveation::covers(fsr_foveation::mapping(field(p),to)))return none;
+            std::shared_ptr<const DlssMotionVectorFrame> inset;
+            for(const auto& f:frames) {
+                if(f==peripheral[0]||f==peripheral[1])continue;
+                bool same=true;
+                for(unsigned j=0;j<3;++j) {
+                    same&=std::abs(f->camera_position[j]-p.camera_position[j])<1e-5F;
+                    same&=std::abs(f->camera_right[j]-p.camera_right[j])<1e-5F&&
+                        std::abs(f->camera_up[j]-p.camera_up[j])<1e-5F&&std::abs(f->camera_forward[j]-p.camera_forward[j])<1e-5F;
+                }
+                if(!same)continue;
+                if(inset||f->publication>releases[eye]||!fsr_foveation::inset(fsr_foveation::mapping(field(*f),to))||
+                    f->depth_inverted!=p.depth_inverted||f->depth_infinite!=p.depth_infinite||
+                    f->camera_near!=p.camera_near||f->camera_far!=p.camera_far||
+                    f->view_space_to_meters!=p.view_space_to_meters||f->frame_time_delta_ms!=p.frame_time_delta_ms)return none;
+                inset=f;
+            }
+            if(!stereo && !inset)return none;
+            // Even on the same queue require actual Execute evidence; on a
+            // different queue wait on the observed producer's fence.
+            for(const auto& f:{peripheral[eye],inset})if(f && !same_identity(f->producer_queue.Get(),queue)&&
+                FAILED(queue->Wait(f->producer_fence.Get(),f->producer_fence_value)))return none;
+            auto joined=std::make_shared<DlssMotionVectorFrame>(p);
+            joined->placed=true;joined->fsr_inset=inset;
+            joined->output_x=v.x;joined->output_y=v.y;joined->output_width=v.width;joined->output_height=v.height;
+            auto set=std::make_shared<DlssMotionVectorSet>();set->eye_count=1;set->eyes[0]=std::move(joined);result[eye]=std::move(set);
+        }
+        return result;
+    }catch(...) {return none;}
+}
+
 namespace {
 
 // An output this many times smaller than the eye's view at most, and of its
@@ -1884,6 +2082,12 @@ std::shared_ptr<const DlssMotionVectorSet> resolve_dlss_motion_vectors(
                 return stale();
             if (other && other != chosen)
                 shared_stream = other->stream == chosen->stream;
+            // A rejected MSFS array stream leaves one native FSR context that
+            // publishes once per real frame. Its adjacent publications are not
+            // evidence of alternating eyes. Require independent native streams
+            // or the explicitly disjoint packed-view path; never invent N-2.
+            if (shared_stream && identity.strict && chosen->fsr_upscale_source)
+                return stale();
             // In OFXR-BRIDGE a CPU publication is not a cross-queue receipt.
             // Apply the existing synchronization check to the actual chosen
             // frame, including older snapshots selected by the watermark.

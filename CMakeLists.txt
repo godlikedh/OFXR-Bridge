@@ -50,7 +50,7 @@ set(XRFG_NVIDIA_OPTICAL_FLOW_SDK_ROOT
     "Path to the NVIDIA Optical Flow SDK 5.0.7 root")
 
 set(XRFG_FIDELITYFX_API_INCLUDE_DIR
-    "${XRFG_DEPENDENCY_ROOT}/FidelityFX/ffx-api/include/ffx_api"
+    "${XRFG_DEPENDENCY_ROOT}/FSR24/Kits/FidelityFX/api/include;${XRFG_DEPENDENCY_ROOT}/FSR24/Kits/FidelityFX/framegeneration/include;${XRFG_DEPENDENCY_ROOT}/FSR24/Kits/FidelityFX/upscalers/include"
     CACHE PATH
     "Path to the modular FidelityFX API headers used by FSR frame generation")
 
@@ -468,6 +468,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         src/vulkan/vulkan_session_bridge.cpp
         src/d3d11/d3d11_color_identity.cpp
         src/d3d12/d3d12_guide_composer.cpp
+        src/d3d12/d3d12_fsr_foveation.cpp
         src/d3d12/d3d12_history.cpp
         src/d3d12/d3d12_fsr_frame_generator.cpp
         ${XRFG_SYNTHESIS_SOURCE}
@@ -504,6 +505,14 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_OSR_FULL_INPAINT_HEADER}"
         "${XRFG_VULKAN_D24_DECODE_HEADER}"
         "${XRFG_D3D11_DEPTH_UNPACK_HEADER}")
+    set(foveation_header "${XRFG_GENERATED_SHADER_DIR}/fsr_foveation_shader.hpp")
+    add_custom_command(OUTPUT "${foveation_header}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${XRFG_GENERATED_SHADER_DIR}"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E main /O3 /WX /Ges
+            /Qstrip_debug /Qstrip_reflect /Fh "${foveation_header}" /Vn g_xrfg_fsr_foveation_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_foveation.hlsl"
+        DEPENDS src/d3d12/fsr_foveation.hlsl VERBATIM)
+    target_sources(xrfg_d3d12_history PRIVATE "${foveation_header}")
     foreach(stage decide compose)
         set(header "${XRFG_GENERATED_SHADER_DIR}/guide_composer_${stage}_shader.hpp")
         if(stage STREQUAL "decide")
@@ -2059,4 +2068,30 @@ if(WIN32 AND XRFG_BUILD_TESTS)
  if(TARGET xrfg_private_runtime_layer_tests)
   add_test(NAME xrfg_osr_peer_pose_metadata COMMAND xrfg_private_runtime_layer_tests osr-peer-pose)
  endif()
+endif()
+
+# Providers share the existing guide snapshots and command-list ownership.
+foreach(t XR_APILAYER_XRFrameBridge_diagnostic xrfg_three_slot_director_tests xrfg_three_slot_d3d12_tests xrfg_private_runtime_layer_tests xrfg_openxr_elliott_meter_tests)
+    if(TARGET ${t})
+        target_sources(${t} PRIVATE src/layer/input_providers.cpp)
+    endif()
+endforeach()
+if(XRFG_BUILD_TESTS)
+    foreach(test fsr_provider_policy fsr_foveation_math)
+        add_executable(xrfg_${test}_tests tests/${test}_tests.cpp)
+        target_include_directories(xrfg_${test}_tests PRIVATE include)
+        target_compile_features(xrfg_${test}_tests PRIVATE cxx_std_20)
+        add_test(NAME xrfg_${test} COMMAND xrfg_${test}_tests)
+    endforeach()
+endif()
+
+set(XRFG_PROFILE_DIRECTORY "ofxr-bridge" CACHE STRING "Local application profile directory")
+if(TARGET xrfg_autonomous_control)
+    target_compile_definitions(xrfg_autonomous_control PRIVATE XRFG_PROFILE_DIRECTORY=L"${XRFG_PROFILE_DIRECTORY}")
+endif()
+
+if(TARGET xrfg_d3d12_history_tests)
+    add_custom_command(TARGET xrfg_d3d12_history_tests POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${XRFG_FSR_RUNTIME}" "$<TARGET_FILE_DIR:xrfg_d3d12_history_tests>/")
+    add_test(NAME xrfg_fsr_warp COMMAND xrfg_d3d12_history_tests fsr-warp)
+    set_tests_properties(xrfg_fsr_warp PROPERTIES TIMEOUT 180)
 endif()

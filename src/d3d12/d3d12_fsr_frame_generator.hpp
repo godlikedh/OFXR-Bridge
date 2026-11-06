@@ -1,4 +1,5 @@
 #pragma once
+#include <future>
 
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 
@@ -39,6 +40,8 @@ struct D3D12FsrEyeInput {
     bool motion_vectors_jittered{};
     bool reset{};
     bool camera_data_valid{};
+    bool fsr_upscale_source{};
+    float view_space_to_meters{1.0F};
 };
 
 [[nodiscard]] bool fsr_generated_array_description(
@@ -61,6 +64,9 @@ public:
         ID3D12GraphicsCommandList* command_list,
         std::span<const D3D12FsrEyeInput> eyes,
         ID3D12Resource** generated_array) noexcept;
+    // Poll without blocking rendering. Provider/context creation runs on a
+    // worker; S_OK means dispatch can use the exact requested configuration.
+    [[nodiscard]] HRESULT prepare(std::span<const D3D12FsrEyeInput> eyes) noexcept;
     [[nodiscard]] bool requires_idle_reconfigure(
         std::span<const D3D12FsrEyeInput> eyes) const noexcept;
     [[nodiscard]] bool output_is_current(unsigned view) const noexcept; // observed SDK reset output
@@ -69,6 +75,9 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::future<std::pair<HRESULT, std::unique_ptr<Impl>>> initialization_;
+    ULONGLONG initialization_retry_after_{};
+    std::uint64_t configuration_generation_{}, initialization_generation_{};
 };
 
 }  // namespace xrfg

@@ -46,6 +46,8 @@ std::atomic_uint32_t handles{};
 std::atomic_uint pending_luke_lists{};
 std::atomic_bool has_luke_context{};
 std::atomic_bool has_reset_hook{};
+std::atomic<FsrRetireCallback> fsr_retire{};
+std::atomic<FsrSubmissionCallback> fsr_submission{};
 std::atomic<ULONGLONG> reset_hook_retry_at{};
 template<std::size_t N> bool finite(const std::array<float,N>& values) {
     for(float v:values)if(!std::isfinite(v))return false;
@@ -86,6 +88,13 @@ void execute_observed(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* co
         begin_dlss_motion_vector_submission(1,unidentified);
     }
     begin_dlss_motion_vector_submission(static_cast<unsigned>(native_lists.size()),native_lists.data());
+    for(auto* list:native_lists) {
+        ComPtr<ID3D12GraphicsCommandList> graphics;
+        if(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&graphics)))) {
+            streamline_camera::retire_fsr_tags(graphics.Get());
+            if(auto callback=fsr_retire.load(std::memory_order_relaxed))callback(graphics.Get(),true);
+        }
+    }
     try {original(queue,count,lists);}
     catch(...) {
         abandon_dlss_motion_vector_submission(static_cast<unsigned>(native_lists.size()),native_lists.data());
@@ -130,6 +139,8 @@ void execute_observed(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* co
             pending_luke_lists.store(static_cast<unsigned>(h.luke_lists.size()),std::memory_order_release);
         }
         report_dlss_motion_vector_submission(actual.Get(),static_cast<unsigned>(native_lists.size()),native_lists.data(),true);
+        if(!normalization_failed)if(auto callback=fsr_submission.load(std::memory_order_relaxed))
+            callback(actual.Get(),count,lists,native_lists.data());
         two_frame_capture_submission(actual.Get(),static_cast<unsigned>(native_lists.size()),native_lists.data());
         neural_rendering::complete_submission(actual.Get(),receipts);
     } else abandon_dlss_motion_vector_submission(static_cast<unsigned>(native_lists.size()),native_lists.data());
@@ -147,7 +158,8 @@ HRESULT STDMETHODCALLTYPE create_queue(ID3D12Device* device,const D3D12_COMMAND_
 HRESULT STDMETHODCALLTYPE reset_command_list(ID3D12GraphicsCommandList* list,
     ID3D12CommandAllocator* allocator,ID3D12PipelineState* initial) {
     const auto result=hooks().reset(list,allocator,initial);
-    if(SUCCEEDED(result))report_dlss_motion_vector_reset(list);
+    if(SUCCEEDED(result)){report_dlss_motion_vector_reset(list);streamline_camera::retire_fsr_tags(list);
+        if(auto callback=fsr_retire.load(std::memory_order_relaxed))callback(list,false);}
     return result;
 }
 bool kcd() {
@@ -309,6 +321,8 @@ void observe_guide_list(ID3D12GraphicsCommandList* input) noexcept {
         }
     }catch(...){}
 }
+void set_fsr_retire_callback(FsrRetireCallback callback) noexcept {fsr_retire.store(callback,std::memory_order_relaxed);}
+void set_fsr_submission_callback(FsrSubmissionCallback callback) noexcept {fsr_submission.store(callback,std::memory_order_relaxed);}
 void observe_luke_production(ID3D12GraphicsCommandList* input) noexcept {
     observe_guide_list(input);
     if(!input || !luke_detected())return;

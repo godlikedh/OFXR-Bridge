@@ -19,6 +19,7 @@
 #include <locale>
 #include <map>
 #include <memory>
+#include <thread>
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
@@ -79,7 +80,7 @@ std::string_view generation_status_text(int mode, int motion_source, GenerationS
 }
 namespace {
 constexpr std::uint32_t kMagic = 0x41465952;
-constexpr std::uint32_t kAbi = 77301;
+constexpr std::uint32_t kAbi = 77303;
 std::atomic_uint overlay_limits{};
 static_assert(offsetof(RuntimeStatus, provider_error)==80); // V611 IPC layout
 static_assert(offsetof(RuntimeStatus, afw_running)==77); // V611 AFW activity field
@@ -95,6 +96,7 @@ struct Shared {
     Settings benchmark_saved{};
     alignas(8) std::uint64_t benchmark_memory_request{};
     BenchmarkMemory benchmark_memory{};
+    DiagnosticsStatus diagnostics{};
 };
 static_assert(std::is_trivially_copyable_v<Shared>);
 
@@ -288,16 +290,18 @@ public:
     void unlock() { mutex.unlock(); }
 #endif
 };
-Channel& channel() {
-    if(process_profile_bound.load(std::memory_order_acquire)) {
-        static Channel runtime(process_profile);return runtime;
-    }
-    const auto file=configuration_path();
+Channel& profile_channel(const std::filesystem::path& file) {
     static std::mutex mutex;
     static std::map<std::filesystem::path,std::unique_ptr<Channel>> instances;
     std::scoped_lock lock(mutex);
     auto& instance=instances[file];if(!instance)instance=std::make_unique<Channel>(file);
     return *instance;
+}
+Channel& channel() {
+    if(process_profile_bound.load(std::memory_order_acquire)) {
+        static Channel runtime(process_profile);return runtime;
+    }
+    return profile_channel(configuration_path());
 }
 struct Lock {
     Channel& owner;
@@ -504,7 +508,11 @@ std::filesystem::path global_configuration_path() {
         throw std::runtime_error("Local application data is unavailable");
     std::filesystem::path result(local);
     CoTaskMemFree(local);
-    return result / L"ofxr-bridge" / L"ofxr-bridge.ini";
+    // This experimental build has an isolated profile and runtime store.
+    #ifndef XRFG_PROFILE_DIRECTORY
+#define XRFG_PROFILE_DIRECTORY L"ofxr-bridge"
+#endif
+    return result / XRFG_PROFILE_DIRECTORY / L"ofxr-bridge.ini";
 #else
     const auto* local = std::getenv("XDG_CONFIG_HOME");
     return std::filesystem::path(local ? local : ".") / "ofxr-bridge" / "ofxr-bridge.ini";
@@ -594,6 +602,115 @@ bool benchmark_enabled() noexcept {
     catch (...) {}
 #endif
     return false;
+}
+
+bool launch_provider_tools(bool collect) noexcept {
+#ifdef _WIN32
+    // The companion lives in the provider package. It owns single-instance
+    // arbitration and the diagnostic worker; OFXR only launches it.
+    try {
+        std::thread([collect] {
+            try {
+                HMODULE module{};wchar_t path[32768]{};
+                if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&launch_provider_tools),&module) || !GetModuleFileNameW(module,path,32768))return;
+                const auto root=std::filesystem::path(path).parent_path();
+                auto exe=root/L"providers/tools/OFXRProviderTools.exe";
+                if(!std::filesystem::is_regular_file(exe))exe=root/L"ofxr/providers/tools/OFXRProviderTools.exe";
+                if(!std::filesystem::is_regular_file(exe))return;
+                auto command=L"\""+exe.wstring()+L"\""+(collect?L" --collect":L"");
+                STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION child{};
+                if(CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,exe.parent_path().c_str(),&startup,&child)) {
+                    CloseHandle(child.hThread);CloseHandle(child.hProcess);
+                }
+            }catch(...){}
+        }).detach();
+        return true;
+    }catch(...){return false;}
+#else
+    (void)collect;return false;
+#endif
+}
+DiagnosticsStatus diagnostics_snapshot() noexcept {
+    try {
+        auto& c = profile_channel(global_configuration_path());
+        thread_local DiagnosticsStatus cached{};
+        thread_local Channel* previous{};
+        if (previous != &c) { cached = {}; previous = &c; }
+        Lock lock(c);
+        if (lock.acquired) cached = c.data->diagnostics;
+        auto result = cached;
+#ifdef _WIN32
+        const auto now = GetTickCount64();
+        if (!result.heartbeat_ms || now < result.heartbeat_ms || now - result.heartbeat_ms > 5000)
+            result.available = false;
+#endif
+        return result;
+    } catch (...) { return {}; }
+}
+bool request_diagnostics() noexcept {
+    try {
+        auto& c = profile_channel(global_configuration_path());
+        Lock lock(c);
+        if (!lock.acquired) return false;
+        auto& d = c.data->diagnostics;
+        if (!d.available || diagnostics_active(d)) return false;
+#ifdef _WIN32
+        const auto now = GetTickCount64();
+        if (!d.heartbeat_ms || now < d.heartbeat_ms || now - d.heartbeat_ms > 5000) return false;
+#endif
+        ++d.request_id;
+        d.phase = DiagnosticsPhase::queued;
+        d.issues = 0; d.zip_path[0] = 0; d.message[0] = 0;
+        return true;
+    } catch (...) { return false; }
+}
+DiagnosticsStatus take_diagnostics_request(bool available) noexcept {
+    try {
+        auto& c = profile_channel(global_configuration_path());
+        Lock lock(c);
+        if (!lock.acquired) return {};
+        auto& d = c.data->diagnostics;
+#ifdef _WIN32
+        const auto pid = GetCurrentProcessId();
+        if (d.controller_pid && d.controller_pid != pid) {
+            const auto owner = OpenProcess(SYNCHRONIZE, FALSE, d.controller_pid);
+            if (owner) {
+                const bool alive = WaitForSingleObject(owner, 0) != WAIT_OBJECT_0;
+                CloseHandle(owner);
+                if (alive) return {}; // A second tray cannot steal an active collector.
+            } else if (GetLastError() != ERROR_INVALID_PARAMETER) return {};
+            if (diagnostics_active(d)) {
+                d.phase = DiagnosticsPhase::failed;
+                std::strcpy(d.message, "The previous tools process exited during collection. Check the diagnostics folder before retrying.");
+            }
+        }
+        d.controller_pid = pid;
+        d.heartbeat_ms = GetTickCount64();
+#endif
+        d.available = available;
+        if (d.phase != DiagnosticsPhase::queued) return {};
+        d.phase = available ? DiagnosticsPhase::running : DiagnosticsPhase::failed;
+        if (!available) std::strcpy(d.message, "Collector missing. Extract the complete package, including scripts.");
+        return d;
+    } catch (...) { return {}; }
+}
+bool report_diagnostics(const DiagnosticsStatus& result) noexcept {
+    try {
+        auto& c = profile_channel(global_configuration_path());
+        Lock lock(c);
+        if (!lock.acquired) return false;
+        auto& d = c.data->diagnostics;
+#ifdef _WIN32
+        if (d.controller_pid != GetCurrentProcessId()) return false;
+#endif
+        if (d.request_id != result.request_id || d.phase != DiagnosticsPhase::running) return false;
+        if (result.phase != DiagnosticsPhase::complete && result.phase != DiagnosticsPhase::failed) return false;
+        d.phase = result.phase; d.issues = result.issues;
+        std::memcpy(d.zip_path, result.zip_path, sizeof(d.zip_path)); d.zip_path[sizeof(d.zip_path)-1] = 0;
+        std::memcpy(d.message, result.message, sizeof(d.message)); d.message[sizeof(d.message)-1] = 0;
+        return true;
+    } catch (...) { return false; }
 }
 
 Snapshot snapshot() noexcept {
