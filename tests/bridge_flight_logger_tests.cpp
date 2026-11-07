@@ -408,6 +408,34 @@ int main(int argc, char** argv) {
         concurrent_records(temporary.path / "flush", false, true);
         live_switch_records(temporary.path / "live-switch");
 
+        const auto collection_directory=temporary.path / "collection";
+        fs::create_directories(collection_directory);
+        const auto settings=collection_directory / "ofxr_bridge.ini";
+        write(settings,"[diagnostics]\r\nlogging_enabled=0\r\n");
+        xrfg::BridgeFlightLogger collection;
+        collection.initialize(collection_directory);
+        const auto settle=[&] {
+            for(unsigned i=0;i<3;++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(270));
+                collection.refresh_settings();
+            }
+        };
+        require(!collection.enabled(),"collection fixture starts with F9 off");
+        const auto saved=read(settings);
+        collection.set_collection_active(true);settle();
+        require(collection.enabled(),"collection must record even with F9 off");
+        const auto collected=collection.log_path();
+        collection.event(xrfg::BridgeFlightOperation::runtime_identity,4321);
+        collection.set_collection_active(false);settle();
+        require(!collection.enabled() && read(settings)==saved,"collection must restore F9 off without editing settings");
+        require(read(collected).find("op=runtime_identity result=4321")!=std::string::npos,
+            "collection timing evidence was not flushed");
+        collection.set_collection_active(true);settle();
+        write(settings,"[diagnostics]\r\nlogging_enabled=1\r\n");
+        collection.set_collection_active(false);settle();
+        require(collection.enabled(),"ending collection must preserve the user's new F9 setting");
+        collection.shutdown();
+
         std::cout << "Bridge flight logger tests passed.\n";
         return 0;
     } catch (const std::exception& exception) {

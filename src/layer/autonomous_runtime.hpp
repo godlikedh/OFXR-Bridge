@@ -29,6 +29,7 @@ inline void apply_runtime_settings() {
     static std::uint64_t applied{};
     std::scoped_lock lock(mutex);
     if(!initialize_game_configuration())return;
+    bridge_flight_logger().set_collection_active(diagnostics_active(diagnostics_snapshot()));
     const auto incoming=snapshot();
     if (applied==incoming.revision) return;
     const auto& s=incoming.desired;

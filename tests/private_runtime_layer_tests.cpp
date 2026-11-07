@@ -2,6 +2,7 @@
 #include "xrfg/benchmark_suite.hpp"
 #include "xrfg/d3d12_native_dlssg.hpp"
 #include <fstream>
+#include <iostream>
 #include "../src/layer/openxr_layer.cpp"
 #define main private_transport_core_main
 #include "private_openxr_runtime_tests.cpp"
@@ -73,6 +74,8 @@ static int panel_metadata_contract() {
 
 int main(int argc,char** argv) {
     std::string route=argc>1?argv[1]:"new";
+    const bool fsr_overlap=route.starts_with("overlap-");
+    if(fsr_overlap)route=route.substr(8);
     if(route=="osr-peer-pose") {
         std::array<XrCompositionLayerProjectionView,2> views{};
         for(unsigned i=0;i<2;++i) {
@@ -763,6 +766,16 @@ int main(int argc,char** argv) {
     // prefer_fps scheduling change while repeating the same 2X Fast policy.
     const unsigned benchmark_policy_phases=benchmark_dlssg_sequence && !benchmark_dlssg_transition && state->native_dlss_generated_frames<2?6:7;
     const unsigned input_count=benchmark_sequence?benchmark_policy_phases*trial_frames:steady_memory?16:8;
+    // FSR context creation is asynchronous. Eight rapidly submitted mock game
+    // frames can all finish before the SDK worker returns. Feed real changing
+    // sources until an actual dispatch succeeds, then begin policy/stall tests.
+    // No readiness override or fabricated successful provider result is used.
+    bool fsr_warmed=route!="fsr" || steady_memory;
+    if(!fsr_warmed)xrfg::set_fsr_background_diagnostics(true);
+    bool fsr_overlap_proven=false;
+    unsigned warmup_frames{};
+    const auto warmup_used=xrfg::fsr_frame_generation_statistics().used;
+    const auto warmup_deadline=std::chrono::steady_clock::now()+20s;
     if(benchmark_sequence) {
         std::fprintf(stderr,"BENCH policies=%u real_inputs=%u actual_3x_to_2x_transition=%u explicit_prefer_fps_transition_diagnostic=%u memory_sampling=%s\n",
             benchmark_policy_phases,input_count,unsigned(benchmark_policy_phases==7 &&
@@ -772,7 +785,8 @@ int main(int argc,char** argv) {
     }
     std::vector<std::shared_ptr<xrfg::InterfaceCycle>> measured_cycles;
     bool hfw_gate_proven=false;
-    for(unsigned n=1;n<=input_count;++n) {
+    for(unsigned n=1;n<=input_count+warmup_frames;++n) {
+        const auto policy_frame=fsr_warmed?n-warmup_frames:0U;
         if(hfw_early && n==4) {
             auto app=find_swapchain(chain);check(bool(app),"cold projection owner");
             const auto cold_generation=app->frame_generation;
@@ -823,9 +837,9 @@ int main(int argc,char** argv) {
             check(find_swapchain(chain)->frame_generation==generation && state->luke_afw_last_evaluated_publication==afw_publication,"buffer-only control discarded engine/AFW history");
             check(state->djules_configuration_epoch.load()==engine_epoch,"buffer-only control reset framework pacing/history epoch");
         }
-        if(toggling && (n==3 || n==5 || n==7)) {
+        if(toggling && (policy_frame==3 || policy_frame==5 || policy_frame==7)) {
             auto desired=xrfg::autonomous::snapshot().desired;
-            desired.pacing_mode=n==3?0:n==5?2:1;
+            desired.pacing_mode=policy_frame==3?0:policy_frame==5?2:1;
             check(xrfg::autonomous::request(desired),"publish only the single-director hot switch");
             xrfg::autonomous::apply_runtime_settings();
             ok(apply_embedded_control(state),"drained single-director hot switch");
@@ -877,6 +891,34 @@ int main(int argc,char** argv) {
             check(independent,"HFW game waited for OFXR synthesis/publication completion");
             hfw_gate_proven=true;
             std::puts("HFW game returns while actual OFXR GPU queue is still blocked PASS");
+        } else if(fsr_overlap && policy_frame==2) {
+            check(sole && native12 && route=="fsr" && state->fsr_two_slot_presenter,
+                "FSR overlap uses the shipping private native two-output path");
+            xr_ok(wait_for_presenter_idle(state),"prior FSR pair accepted");
+            xr_ok(f.transport->drain(),"prior FSR native delivery drained");
+            ComPtr<ID3D12Fence> gate;
+            ok(f.device12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)),"FSR queue gate");
+            ok(state->d3d12_synthesis_queue->Wait(gate.Get(),1),"withhold FSR GPU completion");
+            const auto delivered=f.real_ends.load();
+            auto producer=std::async(std::launch::async,[&]{return layer_end_frame_impl(state->handle,&end);});
+            const bool independent=producer.wait_for(500ms)==std::future_status::ready;
+            bool backpressure=false,unfinished_hidden=false;
+            std::future<XrResult> next_admission;
+            if(independent) {
+                next_admission=std::async(std::launch::async,[&]{return wait_for_native_preparation_admission(state,true);});
+                backpressure=next_admission.wait_for(30ms)==std::future_status::timeout;
+                unfinished_hidden=f.real_ends.load()==delivered;
+            }
+            // Always unblock before assertions/future destructors, including
+            // on the old implementation where End waits for this very fence.
+            ok(gate->Signal(1),"release FSR GPU gate");
+            xr_ok(producer.get(),"shipping FSR End with GPU completion withheld");
+            if(next_admission.valid())xr_ok(next_admission.get(),"next pair resumes after owned output acceptance");
+            check(independent,"FSR End must let the game render while its GPU pair is pending");
+            check(backpressure,"next End must retain bounded output admission");
+            check(unfinished_hidden,"unfinished FSR images reached the native runtime");
+            fsr_overlap_proven=true;
+            std::puts("FSR overlap: game returns before GPU completion, next-pair backpressure and no unfinished presentation PASS");
         } else if(blocked && n==2) {
             f.wait_count(1); // all three endpoint credits are free before the probe
             f.block_end=true;f.end_entered=false;
@@ -936,13 +978,35 @@ int main(int argc,char** argv) {
                     control.lower_vram,control.separate_synthesis,unsigned(control.triple_frame_gen),actual_triple?3U:2U,memory_phase_peaks[phase]);std::fflush(stdout);
             }
         }
+        if(!fsr_warmed) {
+            ++warmup_frames;
+            const auto statistics=xrfg::fsr_frame_generation_statistics();
+            fsr_warmed=statistics.used>warmup_used && state->fsr_two_slot_presenter;
+            if(!fsr_warmed) {
+                if(std::chrono::steady_clock::now()>=warmup_deadline) {
+                    std::fprintf(stderr,"FSR warmup status=%u attempts=%llu used=%llu failures=%llu\n",
+                        unsigned(statistics.status),statistics.attempts,statistics.used,statistics.failures);
+                    const auto evidence=std::filesystem::temp_directory_path()/
+                        (L"ofxr-fsr-fixture-"+std::to_wstring(GetCurrentProcessId()));
+                    std::filesystem::create_directories(evidence);
+                    xrfg::flush_fsr_background_diagnostics(evidence);
+                    for(const auto& file:std::filesystem::directory_iterator(evidence)) {
+                        std::ifstream log(file.path());std::cerr<<log.rdbuf();
+                    }
+                    std::filesystem::remove_all(evidence);
+                }
+                check(std::chrono::steady_clock::now()<warmup_deadline,"FSR asynchronous provider never produced a real generated pair");
+                std::this_thread::sleep_for(1ms);
+            } else std::printf("FSR asynchronous warmup: %u real source frames, %llu successful dispatches\n",warmup_frames,statistics.used);
+        }
     }
+    check(!fsr_overlap || fsr_overlap_proven,"FSR overlap probe never exercised a warmed generator");
     if(hfw && !toggling)check(hfw_gate_proven,"HFW never promoted to actual synthesis worker");
     xr_ok(wait_for_synthesis_handoff(state),"worker complete");
     if(continuous_presenter_active(state))xr_ok(wait_for_presenter_idle(state),"generator transport drained");
     xr_ok(f.transport->drain(),"common physical FIFO drained");
     stop_continuous_presenter(state);
-    auto generated=count>0 && f.real_ends>=(steady_memory?input_count+4:(switching || hfw_offon)?10:12);
+    auto generated=count>0 && f.real_ends>=((steady_memory || route=="fsr")?input_count+warmup_frames+4:(switching || hfw_offon)?10:12);
     std::printf("%s physical outputs=%u generation state=%u\n",route.c_str(),f.real_ends.load(),unsigned(state->generation_status.load()));
     if(!generated) {
         const auto ext=xrfg::autonomous::snapshot();const auto inner=xrfg::embedded::snapshot();const auto chain_state=find_swapchain(chain);
@@ -955,10 +1019,11 @@ int main(int argc,char** argv) {
     check(generated,"actual generator must produce synthetic outputs beyond accepted real inputs");
     if(sole) {
         check(std::is_sorted(f.positions.begin(),f.positions.end()),"all generated and real metadata leave in source order");
-        for(unsigned source=1;source<=(steady_memory?input_count:8);++source)
+        for(unsigned source=1;source<=(steady_memory || route=="fsr"?input_count+warmup_frames:8);++source)
             check(std::any_of(f.positions.begin(),f.positions.end(),[&](float x){return std::abs(x-(float(source)-.032F))<.001F;}),
                 "every accepted real source reaches native End, including final drain");
-        check(!f.pixels.empty() && f.pixels.back()==160,"last real retains its own pixels through bridge/drain");
+        const auto final_color=((input_count+warmup_frames-1)%8+1)*20;
+        check(!f.pixels.empty() && f.pixels.back()==final_color,"last real retains its own pixels through bridge/drain");
     }
     check(f.director_policies.size()==f.handoffs.size(),"native handoffs record their effective delivery policy");
     for(unsigned i=1;i<f.handoffs.size();++i) {
