@@ -17812,7 +17812,17 @@ XrResult layer_end_frame_impl(
             // admission at its next EndFrame prevents output reuse/backlog.
             if (presenter_content_lock.owns_lock()) presenter_content_lock.unlock();
             frame_call_lock.unlock();
-            return single_director_pacing(*state) ? wait_for_presenter_idle(state) : result;
+            // Native FSR owns both output images, their publication leases and
+            // the captured inputs before enqueue. Its consumer waits the exact
+            // synthesis fence and the private endpoint owns presentation pace.
+            // Waiting for that consumer here serializes the NEXT game frame
+            // behind this pair's GPU work. Admission at the next End still
+            // drains the upper queue before recording another pair; private
+            // image acquisition and busy flags retain their reuse protection.
+            const bool overlap_fsr = state->private_runtime && state->fsr_two_slot_presenter &&
+                defer_native_direct_publication(*state);
+            return single_director_pacing(*state) && !overlap_fsr
+                ? wait_for_presenter_idle(state) : result;
         }
         // The once-per-pair hold. The layer submits one pair per application
         // frame and a pair costs two presenter frames, so without this an

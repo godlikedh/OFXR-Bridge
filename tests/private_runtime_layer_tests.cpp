@@ -73,6 +73,8 @@ static int panel_metadata_contract() {
 
 int main(int argc,char** argv) {
     std::string route=argc>1?argv[1]:"new";
+    const bool fsr_overlap=route.starts_with("overlap-");
+    if(fsr_overlap)route=route.substr(8);
     if(route=="osr-peer-pose") {
         std::array<XrCompositionLayerProjectionView,2> views{};
         for(unsigned i=0;i<2;++i) {
@@ -877,6 +879,33 @@ int main(int argc,char** argv) {
             check(independent,"HFW game waited for OFXR synthesis/publication completion");
             hfw_gate_proven=true;
             std::puts("HFW game returns while actual OFXR GPU queue is still blocked PASS");
+        } else if(fsr_overlap && n==2) {
+            check(sole && native12 && route=="fsr" && state->fsr_two_slot_presenter,
+                "FSR overlap uses the shipping private native two-output path");
+            xr_ok(wait_for_presenter_idle(state),"prior FSR pair accepted");
+            xr_ok(f.transport->drain(),"prior FSR native delivery drained");
+            ComPtr<ID3D12Fence> gate;
+            ok(f.device12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)),"FSR queue gate");
+            ok(state->d3d12_synthesis_queue->Wait(gate.Get(),1),"withhold FSR GPU completion");
+            const auto delivered=f.real_ends.load();
+            auto producer=std::async(std::launch::async,[&]{return layer_end_frame_impl(state->handle,&end);});
+            const bool independent=producer.wait_for(500ms)==std::future_status::ready;
+            bool backpressure=false,unfinished_hidden=false;
+            std::future<XrResult> next_admission;
+            if(independent) {
+                next_admission=std::async(std::launch::async,[&]{return wait_for_native_preparation_admission(state,true);});
+                backpressure=next_admission.wait_for(30ms)==std::future_status::timeout;
+                unfinished_hidden=f.real_ends.load()==delivered;
+            }
+            // Always unblock before assertions/future destructors, including
+            // on the old implementation where End waits for this very fence.
+            ok(gate->Signal(1),"release FSR GPU gate");
+            xr_ok(producer.get(),"shipping FSR End with GPU completion withheld");
+            if(next_admission.valid())xr_ok(next_admission.get(),"next pair resumes after owned output acceptance");
+            check(independent,"FSR End must let the game render while its GPU pair is pending");
+            check(backpressure,"next End must retain bounded output admission");
+            check(unfinished_hidden,"unfinished FSR images reached the native runtime");
+            std::puts("FSR overlap: game returns before GPU completion, next-pair backpressure and no unfinished presentation PASS");
         } else if(blocked && n==2) {
             f.wait_count(1); // all three endpoint credits are free before the probe
             f.block_end=true;f.end_entered=false;

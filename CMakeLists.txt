@@ -1210,6 +1210,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_executable(xrfg_three_slot_d3d12_tests tests/three_slot_d3d12_tests.cpp
             src/common/embedded_control.cpp)
         add_executable(xrfg_private_runtime_layer_tests tests/private_runtime_layer_tests.cpp src/common/embedded_control.cpp)
+        add_test(NAME xrfg_private_fsr_overlap COMMAND xrfg_private_runtime_layer_tests overlap-solo-separate-fsr)
+        set_tests_properties(xrfg_private_fsr_overlap PROPERTIES TIMEOUT 90)
         foreach(shape native-split native-array native-packed luke-split)
             foreach(format rgba8 rgba16f)
                 add_test(NAME xrfg_steamvr_vram_${shape}_${format}

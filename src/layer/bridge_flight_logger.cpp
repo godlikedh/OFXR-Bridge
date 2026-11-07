@@ -566,8 +566,9 @@ void BridgeFlightLogger::refresh_settings() noexcept {
         // Retire the old writer on the control caller, never on whichever
         // producer happens to release the last transient shared reference.
         std::erase_if(retired_, [](const auto& writer) { return writer.use_count() == 1; });
-        const bool desired = GetPrivateProfileIntW(kConfigurationSection, L"logging_enabled", 0,
-            (module_directory_ / kConfigurationFileName).c_str()) != 0;
+        const bool desired = collection_active_.load(std::memory_order_relaxed) ||
+            GetPrivateProfileIntW(kConfigurationSection, L"logging_enabled", 0,
+                (module_directory_ / kConfigurationFileName).c_str()) != 0;
         if (desired != candidate_enabled_) {
             candidate_enabled_ = desired; candidate_since_ = now; return;
         }
@@ -594,6 +595,7 @@ void BridgeFlightLogger::shutdown() noexcept {
         retired_.clear(); // Teardown callers have already drained producers.
         ram_recording_.store(false); ram_.reset(); ram_mode_ = false;
         gpu_instrumentation_enabled_.store(false);
+        collection_active_.store(false);
         initialized_.store(false, std::memory_order_release);
         next_poll_.store(0);
         { std::scoped_lock startup(startup_mutex_); startup_count_ = 0; }

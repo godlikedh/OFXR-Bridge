@@ -237,6 +237,11 @@ public:
     void shutdown() noexcept;
     // Bounded live INI polling; invoke outside resource/presenter locks.
     void refresh_settings() noexcept;
+    // A collection temporarily records frame timing without changing F9 or
+    // persisted settings. The normal bounded polling applies the request.
+    void set_collection_active(bool active) noexcept {
+        collection_active_.store(active, std::memory_order_relaxed);
+    }
     // Explicit diagnostic/teardown use only; never called on a render path.
     void flush() noexcept;
     [[nodiscard]] bool gpu_instrumentation_enabled() const noexcept {
@@ -289,6 +294,7 @@ private:
     std::atomic<std::shared_ptr<Impl>> impl_;
     std::unique_ptr<RamTimingCapture> ram_;
     std::atomic<bool> ram_recording_{false};
+    std::atomic<bool> collection_active_{false};
     std::atomic<bool> gpu_instrumentation_enabled_{false}, disk_enabled_{false}, initialized_{false};
     std::atomic<std::uint64_t> next_poll_{0};
     std::mutex control_mutex_, startup_mutex_;
