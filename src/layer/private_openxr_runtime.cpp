@@ -98,7 +98,7 @@ struct PrivateOpenXrRuntime::Impl {
     struct WaitResult {
         XrFrameState prediction{XR_TYPE_FRAME_STATE};
         XrResult result{XR_SUCCESS};
-        std::int64_t entered{},returned{};
+        std::int64_t entered{},returned{},handoff_ns{};
     };
     struct WaitJob {std::int64_t target{};std::uint64_t accepted_ordinal{};};
     Options options;
@@ -455,9 +455,12 @@ struct PrivateOpenXrRuntime::Impl {
         changed.notify_all();return true;
     }
     std::optional<WaitResult> take_wait() {
+        const auto take_enter=clock_ns();
         std::unique_lock lock(mutex);changed.wait(lock,[&]{return stopping || wait_result.has_value();});
         if(stopping)return {};
-        auto result=std::move(wait_result);wait_result.reset();return result;
+        auto result=std::move(wait_result);wait_result.reset();
+        result->handoff_ns=PrivateRuntimeBudget::handoff_cost(take_enter,result->returned,clock_ns());
+        return result;
     }
     void wait_loop() noexcept {
         try {for(;;) {
@@ -551,6 +554,7 @@ struct PrivateOpenXrRuntime::Impl {
                 auto clock=take_wait();if(!clock)break;
                 prediction=clock->prediction;result=clock->result;
                 auto wait_enter=clock->entered,wait_leave=clock->returned;
+                auto handoff_ns=clock->handoff_ns;
                 const auto begin_enter=clock_ns();
                 if(XR_SUCCEEDED(result)) {
                     waited=true;
@@ -584,7 +588,7 @@ struct PrivateOpenXrRuntime::Impl {
                 // native entry earlier changes neither producer nor End cadence.
                 std::int64_t deadline{};
                 if(directed) {
-                    runtime_budget.observe(wait_leave-wait_enter+begun_at-begin_enter+release_leave-release_enter,physical);
+                    runtime_budget.observe(wait_leave-wait_enter+handoff_ns+begun_at-begin_enter+release_leave-release_enter,physical);
                     if(diagnostic)options.trace(15,packet->sequence,release_enter,release_leave-release_enter);
                     // Only fully prepared packets reach this thread. Arrival time,
                     // not a rounded refresh slot, supplies the exact late hold.
@@ -648,12 +652,13 @@ struct PrivateOpenXrRuntime::Impl {
                         result=fresh->result;if(XR_FAILED(result))break;
                         prediction=fresh->prediction;waited=true;
                         wait_enter=fresh->entered;wait_leave=fresh->returned;
+                        handoff_ns=fresh->handoff_ns;
                         const auto entered=clock_ns();
                         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
                         result=options.real.begin(options.real.session,&begin);
                         if(XR_FAILED(result))break;
                         waited=false;begun=true;begun_at=clock_ns();++renewed;
-                        runtime_budget.observe(wait_leave-wait_enter+begun_at-entered,physical);
+                        runtime_budget.observe(wait_leave-wait_enter+handoff_ns+begun_at-entered,physical);
                         if(slots.valid()) {
                             if(options.physical_clock)if(auto c=options.physical_clock())slots.clock(*c);
                             deadline=slots.claim_prepared(packet->accepted_at,
@@ -670,6 +675,7 @@ struct PrivateOpenXrRuntime::Impl {
                     if(diagnostic) {
                         options.trace(7,packet->sequence,wait_enter,0);options.trace(6,packet->sequence,wait_leave,0);
                         options.trace(16,packet->sequence,begun_at,runtime_budget.lead(physical));
+                        options.trace(29,packet->sequence,handoff_ns,wait_leave);
                         if(slots.valid())options.trace(20,packet->sequence,deadline,static_cast<std::int64_t>(slots.slot()));
                         options.trace(24,packet->sequence,prediction_qpc(prediction).value_or(0),renewed);
                     }

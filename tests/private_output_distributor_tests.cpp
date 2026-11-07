@@ -10,6 +10,15 @@ static void require(bool v,const char* what){if(!v)throw std::runtime_error(what
 #include "ready_slot_witnesses.inc"
 int main(){try {
     constexpr std::int64_t ms=1'000'000;
+    require(xrfg::PrivateRuntimeBudget::handoff_cost(10*ms,11*ms,12*ms)==ms,
+        "waiting consumer lost its wakeup delay after native Wait returned");
+    require(xrfg::PrivateRuntimeBudget::handoff_cost(20*ms,11*ms,20*ms+2'000)==2'000,
+        "prefetched result charged the previous frame's intentional delay");
+    require(xrfg::PrivateRuntimeBudget::handoff_cost(20*ms,21*ms,20*ms)==0,
+        "invalid handoff timestamps produced negative runtime work");
+    xrfg::PrivateRuntimeBudget waking;
+    waking.observe(200'000+xrfg::PrivateRuntimeBudget::handoff_cost(10*ms,11*ms,12*ms),11*ms);
+    require(waking.lead(11*ms)==2'300'000,"wakeup delay must advance runtime entry, not the physical handoff clock");
     xrfg::PrivateRuntimeBudget budget;
     require(budget.lead(11*ms)==1'100'000,"unsampled native entry must reserve the requested extra1ms, not a whole frame");
     budget.observe(5*ms,11*ms);
