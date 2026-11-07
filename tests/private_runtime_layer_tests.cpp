@@ -2,6 +2,7 @@
 #include "xrfg/benchmark_suite.hpp"
 #include "xrfg/d3d12_native_dlssg.hpp"
 #include <fstream>
+#include <iostream>
 #include "../src/layer/openxr_layer.cpp"
 #define main private_transport_core_main
 #include "private_openxr_runtime_tests.cpp"
