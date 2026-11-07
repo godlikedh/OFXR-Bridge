@@ -179,12 +179,14 @@ struct Snapshot {
 };
 
 enum class DiagnosticsPhase : unsigned { idle, queued, running, complete, failed };
+enum class DiagnosticsDetail : unsigned { saved, basic, detailed };
 struct DiagnosticsStatus {
     DiagnosticsPhase phase{};
     bool available{};
     unsigned controller_pid{}, issues{};
     std::uint64_t heartbeat_ms{}, request_id{};
     char zip_path[2048]{}, message[512]{}; // UTF-8, transient; never saved to settings
+    DiagnosticsDetail detail{}; // fixed when queued; interpreted by companion tools
 };
 inline bool diagnostics_active(const DiagnosticsStatus& value) noexcept {
     return value.phase == DiagnosticsPhase::queued || value.phase == DiagnosticsPhase::running;
@@ -192,9 +194,9 @@ inline bool diagnostics_active(const DiagnosticsStatus& value) noexcept {
 // Global-profile mailbox, shared across desktop/game profiles and VR sessions.
 // UI operations acquire the IPC lock without waiting and never launch a process.
 DiagnosticsStatus diagnostics_snapshot() noexcept;
-bool request_diagnostics() noexcept;
+bool request_diagnostics(DiagnosticsDetail detail = DiagnosticsDetail::saved) noexcept;
 // Launch the installed companion tool on a worker thread; never run collection in the game.
-bool launch_provider_tools(bool collect) noexcept;
+bool launch_provider_tools(bool collect, DiagnosticsDetail detail = DiagnosticsDetail::saved) noexcept;
 // Tray only: heartbeat, recover an exited controller, and claim at most one request.
 DiagnosticsStatus take_diagnostics_request(bool available) noexcept;
 bool report_diagnostics(const DiagnosticsStatus& result) noexcept;

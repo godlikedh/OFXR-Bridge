@@ -167,6 +167,21 @@ void rebase_and_publish() {
         "closing a held resolution edit publishes without another ImGui frame");
 }
 
+void headset_diagnostic_controls() {
+    const auto revision=snapshot().revision;
+    const auto settings=snapshot().desired;
+    Context headset({1024,768},true);headset.draw();headset.draw(true);
+    require(headset.rendered_text.find("Detailed execution timeline")!=std::string::npos &&
+        headset.rendered_text.find("Collect diagnostics")!=std::string::npos,
+        "headset exposes detailed capture without opening desktop tools");
+    require(!headset.widgets.detailed_diagnostics,"new headset menu defaults to basic capture");
+    headset.activate("/Generation_","Detailed execution timeline");headset.draw();headset.draw();
+    require(headset.widgets.detailed_diagnostics,"headset navigation enables detailed capture");
+    require(snapshot().revision==revision && snapshot().desired==settings,
+        "diagnostic detail cannot reconfigure frame generation");
+    headset.activate("/Generation_","Detailed execution timeline");headset.draw();headset.draw();
+    require(!headset.widgets.detailed_diagnostics,"headset navigation restores basic capture");
+}
 void route_motion_widgets() {
     auto settings = snapshot().desired;
     settings.frame_generation = 0; settings.backend = 3;
@@ -521,7 +536,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::strcmp(argv[1], "--route-motion") == 0) route_motion_widgets();
         else if (argc == 2 && std::strcmp(argv[1], "--route-multiplier") == 0) route_multiplier_widgets();
-        else { rebase_and_publish(); release_controls(); actual_widgets(); route_motion_widgets(); route_multiplier_widgets(); automatic_buttons(); offline_preset(); }
+        else { rebase_and_publish(); headset_diagnostic_controls(); release_controls(); actual_widgets(); route_motion_widgets(); route_multiplier_widgets(); automatic_buttons(); offline_preset(); }
         std::filesystem::remove(configuration_path());
         std::filesystem::remove(profile/L"dlssg-profile-selection.ini");
         std::filesystem::remove(profile);
