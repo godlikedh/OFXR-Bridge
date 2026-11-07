@@ -600,8 +600,12 @@ struct PrivateOpenXrRuntime::Impl {
                     if(diagnostic && margin)options.trace(17,packet->sequence,begun_at,margin);
                     if(slots.valid()) {
                         slots.adopt_handoff(last_handoff);
-                        deadline=slots.claim(packet->accepted_at,packet->prepared_at,begun_at,
-                            clock_ns(),PrivateRuntimeBudget::presentation_margin);
+                        // All prerequisites are complete. Requiring another
+                        // 1.1ms after Begin discards usable display slots when
+                        // native-entry wakeup varies by only a few microseconds.
+                        // Keep that reserve in post_wait(), before the work.
+                        deadline=slots.claim_prepared(packet->accepted_at,
+                            packet->prepared_at,clock_ns());
                         if(diagnostic) {
                             options.trace(19,packet->sequence,packet->accepted_at+slots.delay(),slots.delay());
                             options.trace(20,packet->sequence,deadline,static_cast<std::int64_t>(slots.slot()));
@@ -652,8 +656,8 @@ struct PrivateOpenXrRuntime::Impl {
                         runtime_budget.observe(wait_leave-wait_enter+begun_at-entered,physical);
                         if(slots.valid()) {
                             if(options.physical_clock)if(auto c=options.physical_clock())slots.clock(*c);
-                            deadline=slots.claim(packet->accepted_at,packet->prepared_at,begun_at,
-                                clock_ns(),PrivateRuntimeBudget::presentation_margin);
+                            deadline=slots.claim_prepared(packet->accepted_at,
+                                packet->prepared_at,clock_ns());
                         } else {
                             schedule.runtime_ready(begun_at,PrivateRuntimeBudget::presentation_margin);
                             deadline=schedule.deadline();

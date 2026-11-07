@@ -143,6 +143,14 @@ public:
     [[nodiscard]] std::int64_t deadline() const noexcept {return due_;}
     [[nodiscard]] std::uint64_t slot() const noexcept {return slot_;}
     void adopt_handoff(std::int64_t at) noexcept {if(!delivered_)last_at_=std::max(last_at_,at);}
+    // Call only after source/copy fences, native Begin and image Release have
+    // completed. The runtime-entry forecast schedules that work earlier; it
+    // is not additional work still owed after completion. claim() retains the
+    // final preparation guard, physical grid and minimum handoff interval.
+    std::int64_t claim_prepared(std::int64_t accepted,std::int64_t available,
+                                std::int64_t now) noexcept {
+        return claim(accepted,available,now,now,0);
+    }
     std::int64_t claim(std::int64_t accepted,std::int64_t available,std::int64_t native_ready,
                        std::int64_t now,std::int64_t native_margin) noexcept {
         if(!valid_)return 0;
