@@ -23,3 +23,18 @@ regression; Windows runtime tests and headset measurements are separate checks.
 This fixes one avoidable cadence loss. A source frame, GPU job or native call
 that actually misses its deadline still requires a later slot. It does not make
 90 FPS possible under arbitrary graphics load or eliminate other game stalls.
+
+## Wait-worker handoff forecast
+
+Later New York captures include ready images whose native Begin/Release still
+finish near or after the handoff edge. The native-entry forecast measured API
+time but omitted the consumer's wakeup delay after the Wait worker returns.
+It now includes `taken - max(take_enter, wait_return)`: a waiting consumer's
+observed handoff cost, excluding the intentional idle time of a prefetched
+result. The existing bounded forecast/decay starts subsequent native entry
+earlier; physical deadlines, the final guard and FIFO ownership are unchanged.
+
+Trace stage 29 records this delay and the Wait-return QPC for hardware comparison.
+Portable regressions check wakeup cost, prefetched results and bounded entry
+budget alongside the existing captured slot tests. This addresses a missing
+forecast input; headset validation must establish its effect on missed slots.

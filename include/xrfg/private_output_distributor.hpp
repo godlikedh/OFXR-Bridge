@@ -18,6 +18,13 @@ class PrivateRuntimeBudget {
     std::int64_t cost_{},previous_{},variation_{};
     bool sampled_{};
 public:
+    // Count only the delay handing a completed Wait to its consumer. A result
+    // prefetched during the previous frame must not charge that intentional
+    // idle interval as runtime work. Units and clocks match the caller's QPC.
+    [[nodiscard]] static std::int64_t handoff_cost(std::int64_t take_enter,
+        std::int64_t wait_return,std::int64_t taken) noexcept {
+        return std::max(std::int64_t{},taken-std::max(take_enter,wait_return));
+    }
     // Owner-selected V589 comparison: open the native cycle 1ms earlier than
     // V588, in addition to its learned service cost/variation and 100us guard.
     static constexpr std::int64_t additional_lead=1'000'000;

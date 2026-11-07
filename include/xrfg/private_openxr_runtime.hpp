@@ -94,6 +94,9 @@ public:
         // virtual output handle in b and native sink in c (not QPC times).
         // Stage26: source read leases released after completed copy; packet ID,
         // QPC ns and lease count. This does not retire real targets or FIFO credits.
+        // Stage29: measured Wait-worker to consumer handoff delay in b (ns),
+        // saved Wait-return QPC in c. Prefetched idle time is excluded. This
+        // feeds the next native-entry forecast without moving the output grid.
         std::function<void(int,std::uint64_t,std::int64_t,std::int64_t)> trace;
         std::function<void(std::int64_t)> accepted_output; // optional native End success, never enqueue
         bool director_enabled{true}; // false: ordered native-runtime paced bypass
