@@ -80,7 +80,7 @@ std::string_view generation_status_text(int mode, int motion_source, GenerationS
 }
 namespace {
 constexpr std::uint32_t kMagic = 0x41465952;
-constexpr std::uint32_t kAbi = 77304;
+constexpr std::uint32_t kAbi = 77305;
 std::atomic_uint overlay_limits{};
 static_assert(offsetof(RuntimeStatus, provider_error)==80); // V611 IPC layout
 static_assert(offsetof(RuntimeStatus, afw_running)==77); // V611 AFW activity field
@@ -604,12 +604,13 @@ bool benchmark_enabled() noexcept {
     return false;
 }
 
-bool launch_provider_tools(bool collect) noexcept {
+bool launch_provider_tools(bool collect, DiagnosticsDetail detail) noexcept {
+    if(detail>DiagnosticsDetail::detailed)return false;
 #ifdef _WIN32
     // The companion lives in the provider package. It owns single-instance
     // arbitration and the diagnostic worker; OFXR only launches it.
     try {
-        std::thread([collect] {
+        std::thread([collect,detail] {
             try {
                 HMODULE module{};wchar_t path[32768]{};
                 if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -619,6 +620,8 @@ bool launch_provider_tools(bool collect) noexcept {
                 if(!std::filesystem::is_regular_file(exe))exe=root/L"ofxr/providers/tools/OFXRProviderTools.exe";
                 if(!std::filesystem::is_regular_file(exe))return;
                 auto command=L"\""+exe.wstring()+L"\""+(collect?L" --collect":L"");
+                if(collect && detail!=DiagnosticsDetail::saved)
+                    command+=detail==DiagnosticsDetail::detailed?L" --diagnostics-detail detailed":L" --diagnostics-detail basic";
                 STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION child{};
                 if(CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,exe.parent_path().c_str(),&startup,&child)) {
                     CloseHandle(child.hThread);CloseHandle(child.hProcess);
@@ -648,7 +651,8 @@ DiagnosticsStatus diagnostics_snapshot() noexcept {
         return result;
     } catch (...) { return {}; }
 }
-bool request_diagnostics() noexcept {
+bool request_diagnostics(DiagnosticsDetail detail) noexcept {
+    if(detail>DiagnosticsDetail::detailed)return false;
     try {
         auto& c = profile_channel(global_configuration_path());
         Lock lock(c);
@@ -660,6 +664,7 @@ bool request_diagnostics() noexcept {
         if (!d.heartbeat_ms || now < d.heartbeat_ms || now - d.heartbeat_ms > 5000) return false;
 #endif
         ++d.request_id;
+        d.detail = detail;
         d.phase = DiagnosticsPhase::queued;
         d.issues = 0; d.zip_path[0] = 0; d.message[0] = 0;
         return true;
