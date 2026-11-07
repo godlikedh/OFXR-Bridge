@@ -236,11 +236,11 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
                 (state.runtime.luke_detected && draft.afw_mode != 0))) {
             changed |= ImGui::Combo("Flow quality", &draft.preset, "Slow\0Medium\0Fast\0");
             changed |= ImGui::Combo("Flow resolution", &draft.scale, "100%\0" "75%\0" "50%\0" "25% (lower flow detail)\0");
-            ImGui::TextWrapped("Flow resolution changes motion estimation only; output stays at full resolution. At high eye resolutions, 25% reduces OFA work with a detail tradeoff.");
+            ImGui::TextWrapped("Flow resolution changes motion estimation only; output stays at full resolution. At high eye resolutions, 25%% reduces OFA work with a detail tradeoff.");
             changed |= ImGui::Checkbox("Bidirectional flow", &draft.backward);
         }
     } else if (draft.frame_generation==3) {
-        ImGui::TextWrapped("Game motion vectors + FidelityFX optical flow (25% per axis). If game guides are unavailable or rejected, uses FidelityFX optical flow.");
+        ImGui::TextWrapped("Game motion vectors + FidelityFX optical flow (25%% per axis). If game guides are unavailable or rejected, uses FidelityFX optical flow.");
     } else {
         ImGui::TextDisabled("Uses game motion vectors and depth");
     }
