@@ -43,10 +43,10 @@ struct D3D12FsrEyeInput {
     bool reset{};
     bool camera_data_valid{};
     bool fsr_upscale_source{};
+    float view_space_to_meters{1.0F};
     // Only for bridge-owned mono guides pinned until this dispatch's GPU fence,
     // with all writes/reads ordered on this queue. Game resources use copies.
     bool borrow_owned_guides{};
-    float view_space_to_meters{1.0F};
 };
 
 [[nodiscard]] bool fsr_generated_array_description(

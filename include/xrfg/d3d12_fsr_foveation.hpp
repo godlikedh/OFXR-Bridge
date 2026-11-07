@@ -6,7 +6,7 @@ namespace xrfg {
 struct D3D12FsrEyeInput;
 // One instance per work slot: descriptors and resource references remain live
 // until its fence. Scratch may be shared only by serial recordings submitted
-// in order on ONE queue; each recording must finish consuming it before return.
+// in order on ONE queue; consume scratch within the same recording as conversion.
 class D3D12FsrFoveation {
 public:
     struct Scratch;

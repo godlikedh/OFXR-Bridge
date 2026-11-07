@@ -199,6 +199,9 @@ void test_fsr_provider_stereo(D3D12WarpFixture& fixture) {
         eyes[eye].motion_state=D3D12_RESOURCE_STATE_COMMON;
     }
     require(generator.requires_idle_reconfigure(eyes),"owned guides drop private copy allocations");
+    // As in the synthesizer, retire submitted work (already waited above) and
+    // reset before replacing a prepared context with a different allocation mode.
+    generator.reset();
     prepare();
     for(unsigned frame=0;frame<3;++frame) {
         ID3D12Resource* generated{};
