@@ -186,7 +186,7 @@ void route_motion_widgets() {
     headset.choose("Frame generation", 0, "OFXR (fast)");
     require(snapshot().desired.motion_vectors == 0, "Hybrid preserves independent OFXR optical flow selection");
     tray.draw();
-    tray.choose("Frame generation", 2, "FSR 3.1 (slow, needs DLSS)");
+    tray.choose("Frame generation", 2, "FSR Frame Generation (game guides)");
     require(snapshot().desired.frame_generation == 1, "actual tray selects FSR");
     headset.draw();
     headset.choose("Frame generation", 0, "OFXR (fast)");

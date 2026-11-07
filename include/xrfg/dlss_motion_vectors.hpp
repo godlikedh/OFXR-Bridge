@@ -97,6 +97,14 @@ struct DlssMotionVectorPublication {
     // REAL VR fills its DLSS-fix constants when the list executes, after the
     // evaluation that publishes this guide. Calibration waits for it.
     bool camera_pending{};
+    // Exact AMD upscale metadata, independent of full scene-camera validity.
+    bool fsr_upscale_source{};
+    float view_space_to_meters{1.0F};
+    // In-process FSR adapter only: copy one explicitly selected plane-zero
+    // mip/array slice into the ordinary owned mono depth snapshot. Absence
+    // preserves the existing whole-resource copy contract.
+    std::optional<std::uint32_t> depth_source_subresource;
+    unsigned source_view_mask{};
 };
 
 // A camera attached to a published frame at its submission.
@@ -111,6 +119,13 @@ struct DlssCameraAttachment {
 // frame is gone, already has a camera, or a later frame already read it.
 bool attach_dlss_motion_vector_camera(std::uint64_t stream, std::uint64_t publication,
     const DlssCameraAttachment& camera) noexcept;
+// Native AMD Prepare supplies axes only; the validated MSFS copy adapter also
+// supplies its off-centre projection and explicitly sets matrices_valid.
+// Replace an unpublished-to-consumer registry pointer; never mutate a frame
+// already retained by a consumer. Original upscale scalars are preserved.
+bool attach_fsr_scene_camera(std::uint64_t stream,std::uint64_t publication,
+    const DlssCameraAttachment& camera,std::uint32_t frame_token,bool matrices_valid=false,
+    unsigned source_view_mask=0) noexcept;
 
 // Scalar native camera history: no retained older GPU resources or SL metadata.
 struct DlssNativeCameraHistory {
@@ -211,6 +226,8 @@ struct DlssMotionVectorFrame {
     bool camera_frame_token_valid{};
     std::uint64_t native_production_sequence{};
     bool camera_pending{}; // see DlssMotionVectorPublication::camera_pending
+    bool fsr_upscale_source{};
+    float view_space_to_meters{1.0F};
     // Nonzero: the camera source places every frame in this one world,
     // whichever NGX handle produced it (REAL VR's chained DLSS-fix steps;
     // Uncharted switches between one handle and one per eye every second
@@ -231,6 +248,12 @@ struct DlssMotionVectorFrame {
     // periphery spreads a few hundred render columns over a whole eye.
     bool placed{};
     std::array<float, 4> placed_motion_rect{};
+    // Only a resolved native-FSR join owns this inset. Stored publications never
+    // point at other histories. Both guides have an exact common camera token.
+    std::shared_ptr<const DlssMotionVectorFrame> fsr_inset;
+    // Set only by the validated MSFS camera/copy adapter: 3 stereo, 15 quad.
+    // Zero remains unknown and cannot authorize a two-input join.
+    unsigned source_view_mask{};
 };
 
 // The vector and depth rectangles a consumer maps the guide's output onto:
@@ -282,6 +305,15 @@ struct DlssEyeView {
     std::uint32_t height{};
 };
 
+// Exact native FSR stereo or periphery/inset join. Requires scene camera + frame tokens,
+// current producer submission receipts and an unambiguous stereo camera pair.
+constexpr std::uint32_t kDlssMotionVectorEyeCount = 2;
+struct DlssMotionVectorSet;
+std::array<std::shared_ptr<const DlssMotionVectorSet>,kDlssMotionVectorEyeCount>
+resolve_fsr_foveated_guides(ID3D12CommandQueue* consumer_queue,
+    const std::array<DlssEyeView,kDlssMotionVectorEyeCount>& eyes,
+    const std::array<std::uint64_t,kDlssMotionVectorEyeCount>& released_at) noexcept;
+
 inline DlssNativeCameraHistory dlss_native_camera_history(const DlssMotionVectorFrame& f) noexcept {
     return {f.stream,f.epoch,f.serial,f.publication,f.camera_frame_token,
         f.motion_width,f.motion_height,f.output_width,f.output_height,
@@ -290,8 +322,6 @@ inline DlssNativeCameraHistory dlss_native_camera_history(const DlssMotionVector
         f.camera_up,f.camera_forward,f.camera_view_to_clip,f.camera_clip_to_view,
         f.native_production_sequence,f.raw_motion_native_span};
 }
-
-constexpr std::uint32_t kDlssMotionVectorEyeCount = 2;
 
 struct DlssMotionVectorSet {
     std::array<std::shared_ptr<const DlssMotionVectorFrame>,
@@ -344,6 +374,12 @@ void configure_dlss_motion_vector_tracking(bool enabled) noexcept;
 // Also collects already retired streams after a rapid re-enable. An empty
 // retirement queue uses an atomic fast path and takes no registry lock.
 void retire_disabled_dlss_motion_vector_resources() noexcept;
+struct DlssSnapshotMemory {
+    bool valid{};
+    std::uint64_t slots{}, bytes{}, retired_slots{};
+};
+// Background diagnostic snapshot. Never waits for the publication registry.
+DlssSnapshotMemory dlss_snapshot_memory(std::uint64_t stream = 0) noexcept;
 void retire_dlss_motion_vector_stream(std::uint64_t stream) noexcept;
 // Failed native SR invalidates temporal joins immediately while preserving the
 // owned slot allocations and in-flight GPU snapshot lifetimes.

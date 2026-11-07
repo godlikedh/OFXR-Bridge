@@ -1,4 +1,5 @@
 #include "xrfg/ngx_guide_capture.hpp"
+#include "xrfg/input_providers.hpp"
 #include "xrfg/upscaler_observation.hpp"
 #ifdef XRFG_NATIVE_DLSSG
 #include "xrfg/dlss_motion_vectors.hpp"
@@ -1921,7 +1922,7 @@ void start_hook_monitor() {
         reinterpret_cast<LPCWSTR>(&start_hook_monitor),&pinned);
     if(!retained&&!native_ingress::legacy_luke_vulkan_detection())return;
     native_ingress::start_luke_detection_notifications();
-    std::thread([]{for(;;){native_ingress::refresh_luke_detection(false);install_feature_hooks();Sleep(50);}}).detach();
+    std::thread([]{for(;;){native_ingress::refresh_luke_detection(false);install_feature_hooks();poll_input_providers();Sleep(50);}}).detach();
 }
 // NGX looks for a feature's module only along the path list of the process's
 // first initialisation, which is usually the game's own DLSS: OFXR's later
@@ -1993,6 +1994,7 @@ void prepare_ngx_feature_discovery(const wchar_t* directory) noexcept {
     try {
         native_ingress::refresh_luke_detection();
         auto& d=discovery(); if(d.ext_hook||d.project_hook||!directory||!*directory)return;
+        poll_input_providers();start_hook_monitor();
         const HMODULE core=load_ngx_core(); if(!core)return;
         install_feature_hooks();start_hook_monitor();
         auto ext=GetProcAddress(core,"NVSDK_NGX_D3D12_Init_Ext");
@@ -2014,6 +2016,7 @@ void prepare_ngx_feature_discovery(const wchar_t* directory) noexcept {
     } catch(...) {}
 }
 void configure_ngx_guide_capture(ID3D12CommandQueue* queue,bool enabled) noexcept {
+    configure_input_providers(queue,enabled);
     try {
         ComPtr<ID3D12Device> luke_device;ComPtr<ID3D12CommandQueue> luke_queue;
         if(queue && native_ingress::query_luke_context(luke_device.GetAddressOf(),luke_queue.GetAddressOf()))
@@ -2075,6 +2078,7 @@ void set_ngx_capture_steamvr_runtime(bool steamvr) noexcept {
     capture_steamvr_runtime.store(steamvr,std::memory_order_relaxed);
 }
 void stop_ngx_guide_capture(ID3D12CommandQueue* queue) noexcept {
+    stop_input_providers(queue);
     native_ingress::stop_queue(queue);
     auto& s=state(); std::scoped_lock lock(s.mutex);
     if(s.queue.Get()==queue) {s.active=false;s.queue.Reset();}

@@ -179,9 +179,20 @@ void test_synthetic_camera_follows_display_pose(
         ? std::optional<xrfg::D3D12ExtraSynthetic>(xrfg::D3D12ExtraSynthetic{
               1, fractions[1], std::span<const xrfg::D3D12ReprojectionView>(views_c[1])})
         : std::nullopt;
-    require(synthesizer.submit_pair(capture_b, views_b, views_c[0], 0, 1, &pair, std::nullopt,
-                motion_b, false, fractions[0], {}, extra, true) == S_OK,
-        label + " pair failed");
+    const auto deadline=GetTickCount64()+90000;
+    unsigned pending_initializations{};
+    HRESULT pair_result{};
+    do {
+        pair_result=synthesizer.submit_pair(capture_b, views_b, views_c[0], 0, 1, &pair, std::nullopt,
+                motion_b, false, fractions[0], {}, extra, true);
+        if(path!=SyntheticCameraPath::fsr || pair_result!=DXGI_ERROR_WAS_STILL_DRAWING)break;
+        ++pending_initializations;
+        require(GetTickCount64()<deadline,label+" background initialization timed out");
+        Sleep(1);
+    }while(true);
+    require(pair_result==S_OK,label + " pair failed");
+    if(path==SyntheticCameraPath::fsr)
+        require(pending_initializations!=0,"cold FSR synthesis must yield while contexts initialize");
     require(path==SyntheticCameraPath::fsr ? !pair.synthetics_in_target_camera : pair.synthetics_in_target_camera,
         label + " did not generate its synthetics in their own cameras");
     require(operation_succeeded(synthesizer.wait_for_idle()), label + " drain failed");
@@ -195,6 +206,15 @@ void test_synthetic_camera_follows_display_pose(
             require(mean_absolute_rgb_error(reset_pixels,current,kCameraWidth,kCameraHeight,eye,0)<0.01,
                 "FSR SDK reset must keep B colour and B camera, even with R19 ON");
         std::cout << "FSR SDK reset: unchanged B RGB output; target-camera receipt false\n";
+        // wait_for_idle retired the source. A new capture window must reset
+        // temporal state without recompiling the already prepared contexts.
+        require_hresult(synthesizer.submit_prime(capture_a,views_a,0,&prime,motion_a),"FSR re-prime after gap");
+        require_frame_start_gate(synthesizer,"FSR re-prime gate");
+        require(synthesizer.submit_pair(capture_b,views_b,views_c[0],0,1,&pair,std::nullopt,
+                    motion_b,false,fractions[0],{},extra,true)==S_OK,"warm FSR context must survive a capture gap");
+        require(!pair.synthetics_in_target_camera,"capture gap must reset SDK history and retain current camera metadata");
+        require_hresult(synthesizer.wait_for_idle(),"FSR re-prime drain");
+        std::cout<<"FSR capture gap: warm contexts reset temporal history without recompilation.\n";
         require(operation_succeeded(history->invalidate()),label+" invalidate");
         return;
     }

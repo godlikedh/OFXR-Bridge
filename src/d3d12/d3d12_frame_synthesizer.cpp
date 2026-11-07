@@ -1,10 +1,12 @@
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "xrfg/d3d12_native_dlssg.hpp"
 #include "xrfg/d3d12_guide_composer.hpp"
+#include "xrfg/d3d12_fsr_foveation.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
 #include "xrfg/gpu_flight_diagnostics.hpp"
 #include "xrfg/two_frame_capture.hpp"
 #include "d3d12_fsr_frame_generator.hpp"
+#include "d3d12_fsr_performance.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 
@@ -912,10 +914,13 @@ struct D3D12FrameSynthesizer::Impl {
 
     struct WorkSlot {
         D3D12RamTiming<5> ram_gpu;
+        D3D12FsrPerformance fsr_performance;
         UINT64 ram_source_identity{}, ram_source_serial{};
         bool ram_pair{};
         // Original snapshots read by R22 remain pinned until this slot's fence.
         std::shared_ptr<const DlssMotionVectorSet> guide_composer_inputs;
+        std::shared_ptr<const DlssMotionVectorSet> fsr_foveation_inputs;
+        std::unique_ptr<D3D12FsrFoveation> fsr_foveation;
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> command_list;
         ComPtr<ID3D12CommandAllocator> synthesis_allocator;
@@ -1106,6 +1111,8 @@ struct D3D12FrameSynthesizer::Impl {
     std::uint64_t next_nvidia_fence_value{1};
     std::uint64_t last_nvidia_fence_value{};
     std::uint64_t fsr_eye_diagnostic_pair{};
+    std::uint64_t fsr_submitted_pairs{};
+    ULONGLONG fsr_submission_log_tick{};
     std::uint64_t fsr_hudless_diagnostic_pair{};
     std::uint64_t nvidia_timestamp_frequency{};
     std::uint32_t next_work_slot{};
@@ -1120,12 +1127,14 @@ struct D3D12FrameSynthesizer::Impl {
     // Witcher can alternate both domains within a few OpenXR frames.
     std::array<std::unique_ptr<D3D12FsrFrameGenerator>, 2>
         fsr_frame_generators;
+    ULONGLONG last_fsr_performance_sample{};
     bool synthesis_enabled{};
     bool flow_resources_deferred{};
     bool copy_resources_retired{};
     bool requested_gpu_timing{};
     bool completion_unknown{};
     std::array<bool, 2> fsr_context_reset_pending{};
+    std::array<bool, 2> fsr_history_reset{true,true};
     std::uint32_t active_fsr_domain{};
     bool recording_uses_fsr_context{};
     bool fsr_stale_guide_gap{};
@@ -2065,6 +2074,8 @@ struct D3D12FrameSynthesizer::Impl {
                 &slot - work_slots.data()) * kTimestampCount;
             if (backend == D3D12OpticalFlowBackend::nvidia)
                 slot.ram_gpu.initialize(device.Get(),queue.Get(),BridgeFlightOperation::gpu_synthesis);
+            if (generation_mode == D3D12FrameGenerationMode::fsr3)
+                slot.fsr_performance.initialize(device.Get(), queue.Get());
             HRESULT result = device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                 IID_PPV_ARGS(slot.allocator.GetAddressOf()));
@@ -2591,7 +2602,10 @@ struct D3D12FrameSynthesizer::Impl {
             input_allow_luke_guide_device_alias;
         flow_resources_deferred = defer_flow_resources && input_generation_mode == D3D12FrameGenerationMode::ofxr;
         requested_gpu_timing = enable_nvidia_gpu_timing;
-        nvidia_gpu_timing_enabled = enable_nvidia_gpu_timing && !flow_resources_deferred;
+        // FSR returns before the legacy span resolve; never publish unwritten
+        // legacy timestamps as valid. Its sampled profiler owns separate queries.
+        nvidia_gpu_timing_enabled = enable_nvidia_gpu_timing && !flow_resources_deferred &&
+            generation_mode != D3D12FrameGenerationMode::fsr3;
         const UINT node_mask = queue->GetDesc().NodeMask;
 
         result = create_root_signature_and_pipelines(node_mask);
@@ -3616,6 +3630,17 @@ struct D3D12FrameSynthesizer::Impl {
             game_motion_pair_failure_code(
                 previous_source, current_source, expected_guide_eyes);
         if (guide_failure != 0) {
+            // Preserve the precise N-1 contract even when the flight ring wraps.
+            // This is metadata only; the existing refusal/reset policy remains.
+            static std::atomic_uint64_t history_refusals{};
+            const auto eye=guide_failure>=10?(guide_failure-10)/100:UINT64_MAX;
+            if((++history_refusals%120)==1 && previous_source.motion_vectors &&
+                eye<guides->eye_count && eye<previous_source.motion_vectors->eye_count &&
+                eye<guides->eyes.size() && guides->eyes[eye] && previous_source.motion_vectors->eyes[eye]) {
+                const auto& a=*previous_source.motion_vectors->eyes[eye];const auto& b=*guides->eyes[eye];
+                fsr_diagnostic("fsr_history_pair",(guide_failure<<32)|eye,a.serial,b.previous_serial,b.serial);
+                fsr_diagnostic("fsr_history_identity",a.stream,b.stream,a.epoch,b.epoch);
+            }
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::waiting_for_guides);
             const auto previous_serial = previous_source.motion_vectors &&
@@ -3772,6 +3797,18 @@ struct D3D12FrameSynthesizer::Impl {
             D3D12ImageRect depth_rect{
                 guide.depth_x, guide.depth_y,
                 guide.depth_width, guide.depth_height};
+            // Generic native FSR requires complete eye-sized outputs. The
+            // validated MSFS stereo/quad adapter supplies copy provenance
+            // and converts its source projection below.
+            if (guide.fsr_upscale_source && !guide.fsr_inset && guide.source_view_mask!=3 &&
+                (guide.placed || guide.output_width != color_rect.width ||
+                 guide.output_height != color_rect.height || guide.output_x != color_rect.offset_x ||
+                 guide.output_y != color_rect.offset_y)) {
+                if (log_fsr_eyes) fsr_diagnostic("fsr_projection_domain_unsupported", guide.stream,
+                    (UINT64(guide.output_width)<<32)|guide.output_height,
+                    (UINT64(color_rect.width)<<32)|color_rect.height);
+                return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
             D3D12ImageRect motion_rect{
                 guide.motion_x, guide.motion_y,
                 guide.motion_width, guide.motion_height};
@@ -3802,7 +3839,7 @@ struct D3D12FrameSynthesizer::Impl {
                 guide.frame_time_delta_ms,
                 guide.camera_near,
                 guide.camera_far,
-                guide.camera_data_valid
+                (guide.camera_data_valid || guide.fsr_upscale_source)
                     ? guide.camera_fov_vertical
                     : std::abs(current_source.views[view_index].fov.angle_up -
                                current_source.views[view_index].fov.angle_down),
@@ -3817,9 +3854,24 @@ struct D3D12FrameSynthesizer::Impl {
                 guide.depth_inverted,
                 guide.depth_infinite,
                 guide.jittered,
-                guide.reset,
+                guide.reset || fsr_history_reset[fsr_domain],
                 guide.camera_data_valid,
+                guide.fsr_upscale_source,
+                guide.view_space_to_meters,
             };
+            if(guide.fsr_inset || guide.source_view_mask==3) {
+                if(cinema_projection||!previous_source.motion_vectors||
+                    guide_eye>=previous_source.motion_vectors->eye_count||
+                    !previous_source.motion_vectors->eyes[guide_eye])return DXGI_ERROR_WAS_STILL_DRAWING;
+                if(!slot.fsr_foveation)slot.fsr_foveation=std::make_unique<D3D12FsrFoveation>();
+                slot.fsr_foveation_inputs=guides;
+                const auto hr=slot.fsr_foveation->convert(slot.command_list.Get(),view_index,guide,
+                    *previous_source.motion_vectors->eyes[guide_eye],current_source.views[view_index].fov,
+                    previous_source.views[view_index].fov,inputs[view_index]);
+                if(log_fsr_eyes)fsr_diagnostic("fsr_foveation_convert",hr,view_index,
+                    (UINT64(inputs[view_index].depth_rect.width)<<32)|inputs[view_index].depth_rect.height,guide.camera_frame_token);
+                if(FAILED(hr))return DXGI_ERROR_WAS_STILL_DRAWING;
+            }
             midpoint_views[view_index] = current_source.views[view_index];
             midpoint_views[view_index].image_rect = color_rect;
             midpoint_views[view_index].pose = interpolate_pose(
@@ -3985,11 +4037,13 @@ struct D3D12FrameSynthesizer::Impl {
         }
 
         ID3D12Resource* generated = nullptr;
+        slot.fsr_performance.mark(slot.command_list.Get()); // Guide conversion complete.
         HRESULT result = fsr_frame_generator->dispatch(
             slot.command_list.Get(),
             std::span<const D3D12FsrEyeInput>(inputs.data(), target_views.size()),
-            &generated);
+            &generated, &slot.fsr_performance);
         if (FAILED(result) || !generated) return FAILED(result) ? result : E_FAIL;
+        fsr_history_reset[fsr_domain]=false;
         active_fsr_domain = fsr_domain;
         recording_uses_fsr_context = true;
 
@@ -4187,7 +4241,10 @@ struct D3D12FrameSynthesizer::Impl {
     [[nodiscard]] HRESULT reset_work_slot(WorkSlot& slot) noexcept {
         // acquire_work_slot already established completion before reuse.
         slot.guide_composer_inputs.reset();
+        slot.fsr_foveation_inputs.reset();
         slot.ram_gpu.harvest();
+        slot.fsr_performance.harvest(fence.Get(), slot.fence_value);
+        slot.fsr_performance.discard_recording();
         slot.ram_pair=false;
         recording_uses_fsr_context = false;
         HRESULT result = slot.allocator->Reset();
@@ -4929,10 +4986,22 @@ struct D3D12FrameSynthesizer::Impl {
             return S_OK;
         }
         if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+            const auto tick = GetTickCount64();
+            if (!last_fsr_performance_sample || tick - last_fsr_performance_sample >= 250) {
+                last_fsr_performance_sample = tick;
+                unsigned mask{};
+                if (current_source.motion_vectors) {
+                    for (const auto& eye : current_source.motion_vectors->eyes)
+                        if (eye) mask |= eye->source_view_mask;
+                }
+                slot.fsr_performance.begin(slot.command_list.Get(), queue.Get(),
+                    current_source.ticket.serial, static_cast<UINT>(target_views.size()), mask);
+            }
             const HRESULT result = record_fsr_pair(
                 slot, previous_source, current_source, target_views,
                 synthetic_destination_index, current_destination_index,
                 debug_marker);
+            slot.fsr_performance.end_recording(slot.command_list.Get(), result);
             if (SUCCEEDED(result)) *used_game_motion = true;
             return result;
         }
@@ -5524,6 +5593,7 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         ID3D12CommandList* lists[] = {slot.command_list.Get()};
+        slot.fsr_performance.submitted();
         queue->ExecuteCommandLists(1, lists);
         two_frame_capture_submission(queue.Get(), 1, lists);
         completion_unknown = true;
@@ -5851,6 +5921,8 @@ struct D3D12FrameSynthesizer::Impl {
         // lists, and its behavior cannot depend on the selected backend.
         WorkSlot& slot = work_slots[work_slot_index];
         slot.ram_gpu.harvest();
+        slot.fsr_performance.harvest(fence.Get(), slot.fence_value);
+        slot.fsr_performance.discard_recording();
         slot.ram_pair = false;
         slot.timing_pending = false;
         recording_uses_fsr_context = false;
@@ -6056,6 +6128,9 @@ struct D3D12FrameSynthesizer::Impl {
         output_ticket->inputs=submission_inputs(next);
         previous = std::move(next);
         fsr_stale_guide_gap = false;
+        // A newly primed pair follows a continuity break. Keep the compiled
+        // contexts, but discard SDK temporal history from the previous window.
+        fsr_history_reset={true,true};
         current_destinations[current_destination_index].fence_value = fence_value;
         next_work_slot = (work_slot_index + 1U) %
             static_cast<std::uint32_t>(work_slots.size());
@@ -6419,8 +6494,8 @@ struct D3D12FrameSynthesizer::Impl {
                 (result == DXGI_ERROR_WAS_STILL_DRAWING ||
                  result == kD3D12FrameSynthesisStaleGuides);
             if (fsr_guides_not_ready) {
-                // record_fsr_pair reports this only before recording GPU work.
-                // Close the freshly reset lists so the same work slot can be
+                // No work from this recording was submitted (guide conversion
+                // may precede asynchronous provider readiness). Close it so it can be
                 // reset and reused when the layer primes the next frame.
                 HRESULT close_result = slot.command_list->Close();
                 if (SUCCEEDED(close_result)) {
@@ -6491,6 +6566,12 @@ struct D3D12FrameSynthesizer::Impl {
         }
         if (generation_mode == D3D12FrameGenerationMode::fsr3) {
             last_fsr_context_fence_values[active_fsr_domain] = fence_value;
+            const auto now=GetTickCount64();
+            if(++fsr_submitted_pairs<=4 || now-fsr_submission_log_tick>=1000) {
+                fsr_submission_log_tick=now;
+                fsr_diagnostic("fsr_pair_submitted",reinterpret_cast<UINT64>(this),fsr_submitted_pairs,
+                    fence_value,last_synthetic_fence_value);
+            }
         }
         if (native_dlss) native_dlss->submitted(fence.Get(), fence_value, last_synthetic_fence_value);
         if (used_game_motion && (!native_dlss || native_pair_generated)) report_dlss_motion_vector_use();
@@ -6539,6 +6620,11 @@ struct D3D12FrameSynthesizer::Impl {
             synthesis_enabled = false;
             return HRESULT_FROM_WIN32(ERROR_IO_INCOMPLETE);
         }
+        // A capture window can end before these work slots are reused. Once
+        // their actual fence completed, release the CPU pins even in bypass;
+        // otherwise dead consumer slots exhaust the producer snapshot ring.
+        for(auto& slot:work_slots)if(fence_status(fence.Get(),slot.fence_value)==S_OK)
+            slot.fsr_foveation_inputs.reset();
         if (!previous.active()) { fsr_stale_guide_gap = false; return S_OK; }
         if (previous.last_use_fence_value == 0) {
             // A tracked real source was never read by synthesis. It has no

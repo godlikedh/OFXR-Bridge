@@ -16,6 +16,7 @@ struct SettingsWidgetState {
     bool dirty{};
     bool scale_editing{};
     bool save_failed{};
+    bool diagnostics_request_failed{};
     bool dlssg_profile_loaded{};
     bool dlssg_target_saved{};
     unsigned dlssg_observed_pid{};

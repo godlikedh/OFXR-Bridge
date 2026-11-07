@@ -160,6 +160,32 @@ void dlssg_preset(SettingsWidgetState& ui, const Snapshot& state, bool compact) 
     ImGui::TextWrapped("C uses Lite blending; A uses Full quality. If the driver rejects C, OFXR tries A. A saved request does not verify the model loaded by NVIDIA; global overrides may still apply.");
 }
 bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
+    if(ImGui::Button("Open provider tools")) ui.diagnostics_request_failed = !launch_provider_tools(false);
+    ImGui::SameLine();
+    const auto diagnostics = diagnostics_snapshot();
+    ImGui::BeginDisabled(diagnostics_active(diagnostics) && diagnostics.available);
+    if (ImGui::Button("Collect diagnostics")) ui.diagnostics_request_failed = !launch_provider_tools(true);
+    ImGui::EndDisabled();
+    if (diagnostics.phase == DiagnosticsPhase::complete) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(diagnostics.issues ? "ZIP ready (collection warnings)" : "ZIP ready");
+        ImGui::TextWrapped("%s", diagnostics.zip_path);
+    } else if (diagnostics.phase == DiagnosticsPhase::failed) {
+        ImGui::TextWrapped("Collection failed: %s", diagnostics.message);
+    } else if (diagnostics_active(diagnostics)) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(diagnostics.available ? "Collecting... Observing at least 15 seconds. Keep playing; you can close F10." : "Collector not responding. Open provider tools.");
+    } else if (!diagnostics.available) {
+        ImGui::TextWrapped("Open provider tools to collect diagnostics.");
+    } else {
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Saves a ZIP in the package's diagnostics folder.");
+    }
+    if (diagnostics.phase == DiagnosticsPhase::complete && diagnostics.issues)
+        ImGui::TextWrapped("%u collection warnings; details are in collection-summary.json inside the ZIP.", diagnostics.issues);
+    if (ui.diagnostics_request_failed)
+        ImGui::TextWrapped("Request was not accepted. Wait a moment and retry.");
+    ImGui::Separator();
     auto& draft=ui.draft;
     bool changed=ImGui::Checkbox("Enable frame generation",&draft.enabled);
     ImGui::SameLine();
@@ -187,7 +213,7 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
     }
     int selected_generation = generation_ui_index(draft.frame_generation);
     if (ImGui::Combo("Frame generation", &selected_generation,
-            "OFXR (fast)\0Hybrid (slow, needs DLSS)\0FSR 3.1 (slow, needs DLSS)\0DLSS Frame Generation (slowest, needs DLSS)\0")) {
+            "OFXR (fast)\0Hybrid (slow, needs DLSS)\0FSR Frame Generation (game guides)\0DLSS Frame Generation (slowest, needs DLSS)\0")) {
         select_generation(draft, generation_from_ui(selected_generation), draft.backend);
         changed = true;
     }
@@ -214,6 +240,10 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
         ImGui::TextWrapped("Game motion vectors + FidelityFX optical flow (25% per axis). If game guides are unavailable or rejected, uses FidelityFX optical flow.");
     } else {
         ImGui::TextDisabled("Uses game motion vectors and depth");
+    }
+    if(draft.frame_generation==1) {
+        ImGui::TextWrapped("A compatible input provider supplies game motion, depth and scene-camera data. Providers are loaded when the game starts.");
+        ImGui::TextWrapped("2X targets half the headset refresh rate from the game: 45 real + 45 generated at 90 Hz. Missed rendering or delivery deadlines reduce the achieved rate.");
     }
     if (state.runtime.luke_detected && draft.afw_mode != 0 &&
         (draft.motion_vectors != 0 || draft.frame_generation != 0))
@@ -274,7 +304,7 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
             static_cast<unsigned long long>(runtime.guide_publications),
             static_cast<unsigned long long>(runtime.guide_matches),
             static_cast<unsigned long long>(runtime.guide_uses));
-        ImGui::TextWrapped("Input detection does not prove a compatible stereo pair. Native ingress currently supports DLSS SR/RR; FSR/XeSS upscaler ingress is unavailable.");
+        ImGui::TextWrapped("The detector above reports DLSS only. This trial records native FSR capture in the diagnostic log. Input detection does not prove a compatible stereo pair. XeSS ingress is unavailable.");
         if (ui.dirty || runtime.applied_revision!=state.revision)
             ImGui::TextWrapped("Applying the requested generation settings...");
         else {
