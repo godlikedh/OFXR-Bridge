@@ -879,7 +879,9 @@ int main(int argc,char** argv) {
             check(independent,"HFW game waited for OFXR synthesis/publication completion");
             hfw_gate_proven=true;
             std::puts("HFW game returns while actual OFXR GPU queue is still blocked PASS");
-        } else if(fsr_overlap && n==2) {
+        } else if(fsr_overlap && n==3) {
+            // Prime and the first real pair have already initialized the SDK;
+            // shader compilation time is not the synchronization under test.
             check(sole && native12 && route=="fsr" && state->fsr_two_slot_presenter,
                 "FSR overlap uses the shipping private native two-output path");
             xr_ok(wait_for_presenter_idle(state),"prior FSR pair accepted");

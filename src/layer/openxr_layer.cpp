@@ -17820,6 +17820,7 @@ XrResult layer_end_frame_impl(
             // drains the upper queue before recording another pair; private
             // image acquisition and busy flags retain their reuse protection.
             const bool overlap_fsr = state->private_runtime && state->fsr_two_slot_presenter &&
+                state->binding_queue && state->d3d12_synthesis_queue &&
                 defer_native_direct_publication(*state);
             return single_director_pacing(*state) && !overlap_fsr
                 ? wait_for_presenter_idle(state) : result;
