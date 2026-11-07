@@ -13,6 +13,7 @@
 #include <fstream>
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "../src/d3d12/d3d12_fsr_frame_generator.hpp"
+#include "../src/d3d12/d3d12_fsr_performance.hpp"
 
 #include <windows.h>
 #include <d3d12.h>

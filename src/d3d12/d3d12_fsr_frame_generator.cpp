@@ -1,4 +1,5 @@
 #include "d3d12_fsr_frame_generator.hpp"
+#include "d3d12_fsr_performance.hpp"
 
 #include "xrfg/bridge_flight_logger.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
@@ -283,6 +284,7 @@ struct D3D12FsrFrameGenerator::Impl {
 
     void destroy_eye(Eye& eye) noexcept {
         if (eye.context && destroy_context) {
+            fsr_diagnostic("fsr_perf_context_release", reinterpret_cast<UINT64>(eye.context));
             static_cast<void>(destroy_context(&eye.context, nullptr));
         }
         eye = {};
@@ -399,8 +401,12 @@ struct D3D12FsrFrameGenerator::Impl {
             same_shape(generated_array->GetDesc(), description)) return S_OK;
         generated_array.Reset();
         generated_array_state = D3D12_RESOURCE_STATE_COMMON;
-        return create_texture(device.Get(), description,
-                              generated_array_state, &generated_array);
+        const auto result = create_texture(device.Get(), description,
+                                           generated_array_state, &generated_array);
+        if (SUCCEEDED(result)) fsr_diagnostic("fsr_perf_array_memory",
+            reinterpret_cast<UINT64>(this), device->GetResourceAllocationInfo(0, 1, &description).SizeInBytes,
+            (description.Width << 32) | description.Height, description.DepthOrArraySize);
+        return result;
     }
 
     [[nodiscard]] static UINT context_flags(
@@ -503,6 +509,30 @@ struct D3D12FsrFrameGenerator::Impl {
             !actual.versionName || !fsr_ml_version(actual.versionName))) {
             destroy_eye(eye); return E_FAIL;
         }
+        // Runs on the existing context-creation worker, never on each frame.
+        // Provider totals and our explicit textures are separate scopes; neither
+        // includes every OFXR history/swapchain allocation or proves residency.
+        FfxApiEffectMemoryUsage memory{};
+        ffxQueryDescFrameGenerationGetGPUMemoryUsage memory_query{};
+        memory_query.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
+        memory_query.gpuMemoryUsageFrameGeneration = &memory;
+        const auto memory_result = query ? query(&eye.context, &memory_query.header) : FFX_API_RETURN_ERROR;
+        const auto identity = reinterpret_cast<UINT64>(eye.context);
+        fsr_diagnostic("fsr_perf_context_memory", identity, memory_result,
+            memory.totalUsageInBytes, memory.aliasableUsageInBytes);
+        UINT64 owned_bytes{};
+        bool owned_valid = true;
+        for (auto* resource : {eye.color.Get(), eye.depth.Get(), eye.motion.Get(), eye.output.Get()}) {
+            const auto desc = resource->GetDesc();
+            const auto bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+            if (bytes == std::numeric_limits<UINT64>::max()) owned_valid = false;
+            else owned_bytes += bytes;
+        }
+        fsr_diagnostic("fsr_perf_eye_memory", identity, eye_index, owned_bytes,
+            unsigned(owned_valid) | (unsigned(ml) << 1));
+        fsr_diagnostic("fsr_perf_context_shape", identity,
+            (UINT64(display_width) << 32) | display_height,
+            (UINT64(render_width) << 32) | render_height, flags);
         eye.display_width = display_width;
         eye.display_height = display_height;
         eye.render_width = render_width;
@@ -608,11 +638,13 @@ struct D3D12FsrFrameGenerator::Impl {
     HRESULT generate_eye(ID3D12GraphicsCommandList* commands,
                          Eye& eye,
                          const D3D12FsrEyeInput& input,
-                         std::size_t eye_index) noexcept {
+                         std::size_t eye_index,
+                         D3D12FsrPerformance* performance) noexcept {
         HRESULT result = ensure_eye(eye, input, eye_index);
         if (FAILED(result)) return result;
         result = copy_inputs(commands, eye, input);
         if (FAILED(result)) return result;
+        if (performance) performance->mark(commands);
 
         const std::uint64_t frame_id = ++eye.frame_id;
         ffxConfigureDescFrameGeneration configure_description{};
@@ -694,6 +726,7 @@ struct D3D12FsrFrameGenerator::Impl {
             std::copy_n(camera.cameraRight,3,v2.cameraRight); std::copy_n(camera.cameraForward,3,v2.cameraForward);
             prepared = dispatch(&eye.context, &v2.header);
         } else prepared = dispatch(&eye.context, &prepare.header);
+        if (performance) performance->mark(commands);
         if (prepared != FFX_API_RETURN_OK) {
             fsr_diagnostic("fsr_prepare_failed", prepared, ml, eye_index, frame_id);
             return E_FAIL;
@@ -715,6 +748,7 @@ struct D3D12FsrFrameGenerator::Impl {
         generation.generationRect = configure_description.generationRect;
         generation.frameID = frame_id;
         const auto generated=dispatch(&eye.context, &generation.header);
+        if (performance) performance->mark(commands);
         if(generated!=FFX_API_RETURN_OK || frame_id<=4 || frame_id%120==0)
             fsr_diagnostic("fsr_dispatch_result",generated,eye_index,frame_id,
                 unsigned(ml)|(unsigned(generation.reset)<<1));
@@ -820,7 +854,8 @@ HRESULT D3D12FsrFrameGenerator::prepare(std::span<const D3D12FsrEyeInput> inputs
 HRESULT D3D12FsrFrameGenerator::dispatch(
     ID3D12GraphicsCommandList* commands,
     std::span<const D3D12FsrEyeInput> inputs,
-    ID3D12Resource** generated_array) noexcept {
+    ID3D12Resource** generated_array,
+    D3D12FsrPerformance* performance) noexcept {
     if (!impl_ || !commands || !generated_array || inputs.empty() ||
         inputs.size() > kMaximumEyes) return E_INVALIDARG;
     *generated_array = nullptr;
@@ -889,7 +924,9 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
 
         const auto context_index = shared_slice ? eye_index : input.output_slice;
         auto& eye = impl_->eyes[context_index];
-        result = impl_->generate_eye(commands, eye, input, context_index);
+        if (performance) performance->input(static_cast<UINT>(eye_index),
+            input.color_rect.width, input.color_rect.height, input.depth_rect.width, input.depth_rect.height);
+        result = impl_->generate_eye(commands, eye, input, context_index, performance);
         if (FAILED(result)) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::dispatch_failed);
@@ -909,6 +946,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         commands->ResourceBarrier(1, &after);
         eye.output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (performance) performance->mark(commands);
     }
     const auto ready = transition(impl_->generated_array.Get(),
                                   D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);

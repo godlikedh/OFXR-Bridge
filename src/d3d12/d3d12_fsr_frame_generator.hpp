@@ -11,6 +11,8 @@
 
 namespace xrfg {
 
+class D3D12FsrPerformance;
+
 struct D3D12FsrEyeInput {
     ID3D12Resource* color{};
     std::uint32_t color_slice{};
@@ -63,7 +65,8 @@ public:
     [[nodiscard]] HRESULT dispatch(
         ID3D12GraphicsCommandList* command_list,
         std::span<const D3D12FsrEyeInput> eyes,
-        ID3D12Resource** generated_array) noexcept;
+        ID3D12Resource** generated_array,
+        D3D12FsrPerformance* performance = nullptr) noexcept;
     // Poll without blocking rendering. Provider/context creation runs on a
     // worker; S_OK means dispatch can use the exact requested configuration.
     [[nodiscard]] HRESULT prepare(std::span<const D3D12FsrEyeInput> eyes) noexcept;

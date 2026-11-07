@@ -6,6 +6,7 @@
 #include "xrfg/gpu_flight_diagnostics.hpp"
 #include "xrfg/two_frame_capture.hpp"
 #include "d3d12_fsr_frame_generator.hpp"
+#include "d3d12_fsr_performance.hpp"
 #include "xrfg/d3d12_ram_timing.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
 
@@ -913,6 +914,7 @@ struct D3D12FrameSynthesizer::Impl {
 
     struct WorkSlot {
         D3D12RamTiming<5> ram_gpu;
+        D3D12FsrPerformance fsr_performance;
         UINT64 ram_source_identity{}, ram_source_serial{};
         bool ram_pair{};
         // Original snapshots read by R22 remain pinned until this slot's fence.
@@ -1125,6 +1127,7 @@ struct D3D12FrameSynthesizer::Impl {
     // Witcher can alternate both domains within a few OpenXR frames.
     std::array<std::unique_ptr<D3D12FsrFrameGenerator>, 2>
         fsr_frame_generators;
+    ULONGLONG last_fsr_performance_sample{};
     bool synthesis_enabled{};
     bool flow_resources_deferred{};
     bool copy_resources_retired{};
@@ -2071,6 +2074,8 @@ struct D3D12FrameSynthesizer::Impl {
                 &slot - work_slots.data()) * kTimestampCount;
             if (backend == D3D12OpticalFlowBackend::nvidia)
                 slot.ram_gpu.initialize(device.Get(),queue.Get(),BridgeFlightOperation::gpu_synthesis);
+            if (generation_mode == D3D12FrameGenerationMode::fsr3)
+                slot.fsr_performance.initialize(device.Get(), queue.Get());
             HRESULT result = device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                 IID_PPV_ARGS(slot.allocator.GetAddressOf()));
@@ -2597,7 +2602,10 @@ struct D3D12FrameSynthesizer::Impl {
             input_allow_luke_guide_device_alias;
         flow_resources_deferred = defer_flow_resources && input_generation_mode == D3D12FrameGenerationMode::ofxr;
         requested_gpu_timing = enable_nvidia_gpu_timing;
-        nvidia_gpu_timing_enabled = enable_nvidia_gpu_timing && !flow_resources_deferred;
+        // FSR returns before the legacy span resolve; never publish unwritten
+        // legacy timestamps as valid. Its sampled profiler owns separate queries.
+        nvidia_gpu_timing_enabled = enable_nvidia_gpu_timing && !flow_resources_deferred &&
+            generation_mode != D3D12FrameGenerationMode::fsr3;
         const UINT node_mask = queue->GetDesc().NodeMask;
 
         result = create_root_signature_and_pipelines(node_mask);
@@ -4029,10 +4037,11 @@ struct D3D12FrameSynthesizer::Impl {
         }
 
         ID3D12Resource* generated = nullptr;
+        slot.fsr_performance.mark(slot.command_list.Get()); // Guide conversion complete.
         HRESULT result = fsr_frame_generator->dispatch(
             slot.command_list.Get(),
             std::span<const D3D12FsrEyeInput>(inputs.data(), target_views.size()),
-            &generated);
+            &generated, &slot.fsr_performance);
         if (FAILED(result) || !generated) return FAILED(result) ? result : E_FAIL;
         fsr_history_reset[fsr_domain]=false;
         active_fsr_domain = fsr_domain;
@@ -4234,6 +4243,8 @@ struct D3D12FrameSynthesizer::Impl {
         slot.guide_composer_inputs.reset();
         slot.fsr_foveation_inputs.reset();
         slot.ram_gpu.harvest();
+        slot.fsr_performance.harvest(fence.Get(), slot.fence_value);
+        slot.fsr_performance.discard_recording();
         slot.ram_pair=false;
         recording_uses_fsr_context = false;
         HRESULT result = slot.allocator->Reset();
@@ -4975,10 +4986,22 @@ struct D3D12FrameSynthesizer::Impl {
             return S_OK;
         }
         if (generation_mode == D3D12FrameGenerationMode::fsr3) {
+            const auto tick = GetTickCount64();
+            if (!last_fsr_performance_sample || tick - last_fsr_performance_sample >= 250) {
+                last_fsr_performance_sample = tick;
+                unsigned mask{};
+                if (current_source.motion_vectors) {
+                    for (const auto& eye : current_source.motion_vectors->eyes)
+                        if (eye) mask |= eye->source_view_mask;
+                }
+                slot.fsr_performance.begin(slot.command_list.Get(), queue.Get(),
+                    current_source.ticket.serial, static_cast<UINT>(target_views.size()), mask);
+            }
             const HRESULT result = record_fsr_pair(
                 slot, previous_source, current_source, target_views,
                 synthetic_destination_index, current_destination_index,
                 debug_marker);
+            slot.fsr_performance.end_recording(slot.command_list.Get(), result);
             if (SUCCEEDED(result)) *used_game_motion = true;
             return result;
         }
@@ -5570,6 +5593,7 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         ID3D12CommandList* lists[] = {slot.command_list.Get()};
+        slot.fsr_performance.submitted();
         queue->ExecuteCommandLists(1, lists);
         two_frame_capture_submission(queue.Get(), 1, lists);
         completion_unknown = true;
@@ -5897,6 +5921,8 @@ struct D3D12FrameSynthesizer::Impl {
         // lists, and its behavior cannot depend on the selected backend.
         WorkSlot& slot = work_slots[work_slot_index];
         slot.ram_gpu.harvest();
+        slot.fsr_performance.harvest(fence.Get(), slot.fence_value);
+        slot.fsr_performance.discard_recording();
         slot.ram_pair = false;
         slot.timing_pending = false;
         recording_uses_fsr_context = false;

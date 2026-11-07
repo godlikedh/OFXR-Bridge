@@ -44,11 +44,47 @@ void test_fsr_provider_stereo(D3D12WarpFixture& fixture) {
     require(generator.prepare(eyes)==DXGI_ERROR_WAS_STILL_DRAWING,"first FG call starts background initialization");
     require(GetTickCount64()-started<1000,"starting FG initialization blocked rendering");
     prepare();
+    xrfg::D3D12FsrPerformance performance;
+    performance.initialize(fixture.device(), fixture.queue());
+    // Abandoned and incomplete recordings may never resolve unwritten queries
+    // or reuse old GPU measurements as a successful generation sample.
+    for (const auto result : {E_FAIL, S_OK}) {
+        fixture.execute_and_wait([&](ID3D12GraphicsCommandList* commands) {
+            require(performance.begin(commands, fixture.queue(), 99, 2, 15), "begin incomplete sample");
+            performance.mark(commands);
+            performance.end_recording(commands, result);
+            performance.submitted();
+        });
+        require(!performance.harvest(fixture.completion_fence(), fixture.last_submitted_value()),
+            "incomplete sample must not resolve or read stale timestamps");
+        performance.discard_recording();
+    }
     for(unsigned frame=0;frame<3;++frame) {
         ID3D12Resource* generated{};
         fixture.execute_and_wait([&](ID3D12GraphicsCommandList* commands) {
-            require_hresult(generator.dispatch(commands,eyes,&generated),"real AMD FG dispatch");
+            require(performance.begin(commands, fixture.queue(), frame + 1, 2, 15), "begin stereo performance sample");
+            performance.mark(commands); // No foveated conversion in this fixture.
+            const auto result = generator.dispatch(commands,eyes,&generated,&performance);
+            require_hresult(result,"real AMD FG dispatch");
+            performance.end_recording(commands, result);
+            performance.submitted();
+            require(!performance.harvest(fixture.completion_fence(), fixture.last_submitted_value() + 1),
+                "performance readback must wait for the existing fence");
+            require(!performance.begin(commands, fixture.queue(), 999, 2, 15),
+                "pending timestamp storage must not be recycled");
         });
+        xrfg::D3D12FsrPerformance::Sample measured{};
+        require(performance.harvest(fixture.completion_fence(), fixture.last_submitted_value(), &measured),
+            "harvest real AMD timestamps after existing completion");
+        require(measured.points == 11 && measured.total_us > 0, "two generated eyes require eleven timing boundaries");
+        UINT64 sum{};
+        for (UINT i = 1; i < measured.points; ++i) sum += measured.gpu_us[i];
+        require(sum <= measured.total_us && measured.total_us - sum < measured.points,
+            "GPU stage durations partition the measured span (microsecond rounding)");
+        require(!performance.harvest(fixture.completion_fence(), fixture.last_submitted_value()),
+            "completed sample must be consumed only once");
+        std::cout << "FSR performance frame=" << frame << " points=" << measured.points
+                  << " gpu_us=" << measured.total_us << '\n';
         require(generated!=nullptr,"FSR output exists");
         const auto actual=readback_pattern(fixture,generated,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
