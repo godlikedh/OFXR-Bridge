@@ -1,4 +1,6 @@
 #include "xrfg/input_providers.hpp"
+#include "xrfg/presented_output_rate.hpp"
+#include <limits>
 #include "xrfg/dlss_motion_vectors.hpp"
 #include "xrfg/fsr_frame_generation.hpp"
 #include "xrfg/native_ingress.hpp"
@@ -129,7 +131,8 @@ int get_status(OFXR_ProviderStatusV1* out) noexcept {
         out->telemetry_tick_ms=t.updated_ms;out->rates_valid=t.rates_valid;out->gpu_valid=t.gpu_valid;
         out->gpu_source=unsigned(t.gpu_source);out->stages_valid=t.stages_valid;out->game_time_valid=t.game_time_valid;
         out->ofxr_time_valid=t.ofxr_time_valid;out->game_fps=t.game_fps;out->generated_fps=t.generated_fps;
-        out->output_fps=t.output_fps;out->display_hz=t.display_hz;out->gpu_render_ms=t.gpu_render_ms;
+        out->output_fps=output_rate_valid(t)?t.output_fps:std::numeric_limits<double>::quiet_NaN();
+        out->display_hz=t.display_hz;out->gpu_render_ms=t.gpu_render_ms;
         out->game_time_ms=t.game_time_ms;out->generation_time_ms=t.generation_time_ms;
         out->delivery_time_ms=t.delivery_time_ms;out->ofxr_time_ms=t.ofxr_time_ms;
         out->snapshot_memory_valid=p.valid;out->snapshot_slots=static_cast<unsigned>(p.slots);
