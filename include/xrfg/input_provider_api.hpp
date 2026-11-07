@@ -65,6 +65,8 @@ struct OFXR_ProviderStatusV1 {
     std::uint64_t fg_attempts{}, fg_dispatches{}, fg_failures{};
     std::uint64_t guide_publications{}, guide_matches{}, guide_uses{}, telemetry_tick_ms{};
     std::uint32_t rates_valid{}, gpu_valid{}, gpu_source{}, stages_valid{}, game_time_valid{}, ofxr_time_valid{};
+    // output_fps is NaN when no delivery measurement is available; a valid zero
+    // means measured zero delivery. This does not change the V1 layout.
     double game_fps{}, generated_fps{}, output_fps{}, display_hz{}, gpu_render_ms{};
     double game_time_ms{}, generation_time_ms{}, delivery_time_ms{}, ofxr_time_ms{};
     std::uint32_t snapshot_memory_valid{}, snapshot_slots{}, retired_snapshot_slots{};

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <iostream>
 #include <stdexcept>
+#include <cmath>
 
 namespace {
 unsigned checks{};
@@ -54,6 +55,7 @@ int main(int count, char** arguments) {
         require(!host->query_camera(nullptr,&camera),"provider refuses missing camera receipt");
         OFXR_ProviderStatusV1 status;
         require(host->get_status(&status) && status.struct_size==sizeof(status),"provider status works across actual DLL boundary");
+        require(!std::isfinite(status.output_fps),"missing delivery telemetry is unknown, not zero FPS");
         status.struct_size=0;
         require(!host->get_status(&status) && !host->get_status(nullptr),"provider status rejects truncated ABI");
         require(version1() == 1 && version2() == 2, "versioned native producer ABI");
