@@ -259,6 +259,9 @@ struct D3D12FsrFrameGenerator::Impl {
         UINT render_width{};
         UINT render_height{};
         UINT context_flags{};
+        DXGI_FORMAT depth_format{}, motion_format{};
+        UINT motion_width{}, motion_height{};
+        bool borrowed_guides{};
         std::uint64_t frame_id{};
     };
 
@@ -424,13 +427,32 @@ struct D3D12FsrFrameGenerator::Impl {
         return flags;
     }
 
+    [[nodiscard]] static bool borrow_guides(const D3D12FsrEyeInput& input) noexcept {
+        const auto whole = [](ID3D12Resource* resource, const D3D12ImageRect& rect,
+            DXGI_FORMAT format, D3D12_RESOURCE_STATES state) {
+            if (!resource || state != D3D12_RESOURCE_STATE_COMMON) return false;
+            const auto d = resource->GetDesc();
+            return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format == format &&
+                d.DepthOrArraySize == 1 && d.MipLevels == 1 && d.SampleDesc.Count == 1 &&
+                rect.offset_x == 0 && rect.offset_y == 0 && rect.width == d.Width && rect.height == d.Height;
+        };
+        return input.borrow_owned_guides &&
+            whole(input.depth, input.depth_rect, DXGI_FORMAT_R32_FLOAT, input.depth_state) &&
+            whole(input.motion_vectors, input.motion_rect, DXGI_FORMAT_R32G32_FLOAT, input.motion_state);
+    }
+
     [[nodiscard]] static bool needs_recreate(
         const Eye& eye, const D3D12FsrEyeInput& input) noexcept {
         return !eye.context || eye.display_width != input.color_rect.width ||
             eye.display_height != input.color_rect.height ||
             eye.render_width != input.depth_rect.width ||
             eye.render_height != input.depth_rect.height ||
-            eye.context_flags != context_flags(input);
+            eye.context_flags != context_flags(input) ||
+            eye.borrowed_guides != borrow_guides(input) ||
+            !input.depth || !input.motion_vectors ||
+            eye.depth_format != input.depth->GetDesc().Format ||
+            eye.motion_format != input.motion_vectors->GetDesc().Format ||
+            eye.motion_width != input.motion_rect.width || eye.motion_height != input.motion_rect.height;
     }
 
     HRESULT ensure_eye(
@@ -455,16 +477,18 @@ struct D3D12FsrFrameGenerator::Impl {
             mono_texture(display_width, display_height, color_format),
             D3D12_RESOURCE_STATE_COMMON, &eye.color);
         if (FAILED(result)) return result;
-        result = create_texture(device.Get(),
-            mono_texture(render_width, render_height,
-                         input.depth->GetDesc().Format),
-            D3D12_RESOURCE_STATE_COMMON, &eye.depth);
-        if (FAILED(result)) return result;
-        result = create_texture(device.Get(),
-            mono_texture(input.motion_rect.width, input.motion_rect.height,
-                         input.motion_vectors->GetDesc().Format),
-            D3D12_RESOURCE_STATE_COMMON, &eye.motion);
-        if (FAILED(result)) return result;
+        if (!borrow_guides(input)) {
+            result = create_texture(device.Get(),
+                mono_texture(render_width, render_height,
+                             input.depth->GetDesc().Format),
+                D3D12_RESOURCE_STATE_COMMON, &eye.depth);
+            if (FAILED(result)) return result;
+            result = create_texture(device.Get(),
+                mono_texture(input.motion_rect.width, input.motion_rect.height,
+                             input.motion_vectors->GetDesc().Format),
+                D3D12_RESOURCE_STATE_COMMON, &eye.motion);
+            if (FAILED(result)) return result;
+        }
         result = create_texture(device.Get(),
             mono_texture(display_width, display_height, color_format,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
@@ -523,13 +547,14 @@ struct D3D12FsrFrameGenerator::Impl {
         UINT64 owned_bytes{};
         bool owned_valid = true;
         for (auto* resource : {eye.color.Get(), eye.depth.Get(), eye.motion.Get(), eye.output.Get()}) {
+            if (!resource) continue;
             const auto desc = resource->GetDesc();
             const auto bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
             if (bytes == std::numeric_limits<UINT64>::max()) owned_valid = false;
             else owned_bytes += bytes;
         }
         fsr_diagnostic("fsr_perf_eye_memory", identity, eye_index, owned_bytes,
-            unsigned(owned_valid) | (unsigned(ml) << 1));
+            unsigned(owned_valid) | (unsigned(ml) << 1) | (unsigned(borrow_guides(input)) << 2));
         fsr_diagnostic("fsr_perf_context_shape", identity,
             (UINT64(display_width) << 32) | display_height,
             (UINT64(render_width) << 32) | render_height, flags);
@@ -538,6 +563,11 @@ struct D3D12FsrFrameGenerator::Impl {
         eye.render_width = render_width;
         eye.render_height = render_height;
         eye.context_flags = flags;
+        eye.borrowed_guides = borrow_guides(input);
+        eye.depth_format = input.depth->GetDesc().Format;
+        eye.motion_format = input.motion_vectors->GetDesc().Format;
+        eye.motion_width = input.motion_rect.width;
+        eye.motion_height = input.motion_rect.height;
         eye.color_state = D3D12_RESOURCE_STATE_COMMON;
         eye.depth_state = D3D12_RESOURCE_STATE_COMMON;
         eye.motion_state = D3D12_RESOURCE_STATE_COMMON;
@@ -581,11 +611,7 @@ struct D3D12FsrFrameGenerator::Impl {
             const auto& input=inputs[i];const auto index=shared?i:input.output_slice;
             if(!input.color || !input.depth || !input.motion_vectors || index>=eyes.size() ||
                 linear_color_format(input.color->GetDesc().Format)!=color_format ||
-                needs_recreate(eyes[index],input) ||
-                eyes[index].depth->GetDesc().Format!=input.depth->GetDesc().Format ||
-                eyes[index].motion->GetDesc().Format!=input.motion_vectors->GetDesc().Format ||
-                eyes[index].motion->GetDesc().Width!=input.motion_rect.width ||
-                eyes[index].motion->GetDesc().Height!=input.motion_rect.height)return false;
+                needs_recreate(eyes[index],input))return false;
         }
         return true;
     }
@@ -593,6 +619,21 @@ struct D3D12FsrFrameGenerator::Impl {
     HRESULT copy_inputs(ID3D12GraphicsCommandList* commands,
                         Eye& eye,
                         const D3D12FsrEyeInput& input) noexcept {
+        if (eye.borrowed_guides) {
+            const D3D12_RESOURCE_BARRIER before[]{
+                transition(input.color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(eye.color.Get(), eye.color_state, D3D12_RESOURCE_STATE_COPY_DEST),
+                transition(input.depth, input.depth_state, kComputeRead),
+                transition(input.motion_vectors, input.motion_state, kComputeRead)};
+            commands->ResourceBarrier(UINT(std::size(before)), before);
+            copy_region(commands, eye.color.Get(), 0, 0, 0, input.color, input.color_slice, input.color_rect);
+            const D3D12_RESOURCE_BARRIER after[]{
+                transition(input.color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                transition(eye.color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kComputeRead)};
+            commands->ResourceBarrier(UINT(std::size(after)), after);
+            eye.color_state = kComputeRead;
+            return S_OK;
+        }
         std::array<D3D12_RESOURCE_BARRIER, 6> before{
             transition(input.color, D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -644,6 +685,20 @@ struct D3D12FsrFrameGenerator::Impl {
         if (FAILED(result)) return result;
         result = copy_inputs(commands, eye, input);
         if (FAILED(result)) return result;
+        // The SDK restores imported resources to their supplied state. Restore
+        // our scratch contract even when configure/prepare/generate fails.
+        struct RestoreGuides {
+            ID3D12GraphicsCommandList* commands;
+            const D3D12FsrEyeInput& input;
+            bool borrowed;
+            ~RestoreGuides() {
+                if (!borrowed) return;
+                const D3D12_RESOURCE_BARRIER barriers[]{
+                    transition(input.depth, kComputeRead, input.depth_state),
+                    transition(input.motion_vectors, kComputeRead, input.motion_state)};
+                commands->ResourceBarrier(UINT(std::size(barriers)), barriers);
+            }
+        } restore{commands, input, eye.borrowed_guides};
         if (performance) performance->mark(commands);
 
         const std::uint64_t frame_id = ++eye.frame_id;
@@ -707,9 +762,9 @@ struct D3D12FsrFrameGenerator::Impl {
         prepare.cameraFovAngleVertical = input.camera_fov_vertical;
         prepare.viewSpaceToMetersFactor = input.view_space_to_meters;
         prepare.depth = ffxApiGetResourceDX12(
-            eye.depth.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            eye.borrowed_guides ? input.depth : eye.depth.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         prepare.motionVectors = ffxApiGetResourceDX12(
-            eye.motion.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            eye.borrowed_guides ? input.motion_vectors : eye.motion.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
         ffxReturnCode_t prepared{};
         if (ml) {
             ffxDispatchDescFrameGenerationPrepareV2 v2{};

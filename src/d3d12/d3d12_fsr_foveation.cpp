@@ -1,6 +1,7 @@
 #include "xrfg/d3d12_fsr_foveation.hpp"
 #include "xrfg/fsr_foveation.hpp"
 #include "d3d12_fsr_frame_generator.hpp"
+#include "xrfg/fsr_frame_generation.hpp"
 #include "fsr_foveation_shader.hpp"
 #include <algorithm>
 #include <cmath>
@@ -35,12 +36,19 @@ bool compatible(const DlssMotionVectorFrame& a,const DlssMotionVectorFrame& b) {
         a.jittered==b.jittered&&a.view_space_to_meters==b.view_space_to_meters&&!a.reset&&!b.reset;
 }
 }
+struct D3D12FsrFoveation::Scratch {
+    struct Eye {ComPtr<ID3D12Resource> depth,motion;UINT width{},height{};};
+    ComPtr<ID3D12Device> device;
+    std::array<Eye,2> eyes;
+};
 struct D3D12FsrFoveation::Impl {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> pipeline;
     ComPtr<ID3D12DescriptorHeap> heap;UINT stride{};
-    struct Eye {ComPtr<ID3D12Resource> depth,motion;UINT width{},height{};};
-    std::array<Eye,2> eyes;
+    std::shared_ptr<Scratch> scratch;
+    // Pin the allocation referenced by this slot's descriptors even when a
+    // later recording replaces the shared allocation after a resolution change.
+    std::array<Scratch::Eye,2> eyes;
     HRESULT initialize(ID3D12GraphicsCommandList* list) {
         if(root)return S_OK;
         HRESULT hr=list->GetDevice(IID_PPV_ARGS(&device));if(FAILED(hr))return hr;
@@ -58,19 +66,34 @@ struct D3D12FsrFoveation::Impl {
         hr=device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap));if(FAILED(hr))return hr;
         stride=device->GetDescriptorHandleIncrementSize(hd.Type);root=std::move(candidate);return S_OK;
     }
-    HRESULT textures(Eye& e,UINT w,UINT h) {
+    HRESULT textures(unsigned eye,UINT w,UINT h) {
+        if(scratch->device && scratch->device.Get()!=device.Get())return E_INVALIDARG;
+        scratch->device=device;
+        auto& e=scratch->eyes[eye];
         if(e.depth&&e.motion&&e.width==w&&e.height==h)return S_OK;
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;
         d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        Eye next;next.width=w;next.height=h;d.Format=DXGI_FORMAT_R32_FLOAT;
+        Scratch::Eye next;next.width=w;next.height=h;d.Format=DXGI_FORMAT_R32_FLOAT;
         auto hr=device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&next.depth));if(FAILED(hr))return hr;
         d.Format=DXGI_FORMAT_R32G32_FLOAT;
         hr=device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&next.motion));if(FAILED(hr))return hr;
+        UINT64 bytes{};
+        for(auto* resource:{next.depth.Get(),next.motion.Get()}) {
+            const auto description=resource->GetDesc();
+            bytes+=device->GetResourceAllocationInfo(0,1,&description).SizeInBytes;
+        }
+        fsr_diagnostic("fsr_perf_scratch_memory",reinterpret_cast<UINT64>(scratch.get()),eye,
+            bytes,(UINT64(w)<<32)|h);
         e=std::move(next);return S_OK;
     }
 };
-D3D12FsrFoveation::D3D12FsrFoveation():impl_(std::make_unique<Impl>()){}
+std::shared_ptr<D3D12FsrFoveation::Scratch> D3D12FsrFoveation::make_scratch() {
+    return std::make_shared<Scratch>();
+}
+D3D12FsrFoveation::D3D12FsrFoveation(std::shared_ptr<Scratch> scratch):impl_(std::make_unique<Impl>()) {
+    impl_->scratch=scratch?std::move(scratch):make_scratch();
+}
 D3D12FsrFoveation::~D3D12FsrFoveation()=default;
 HRESULT D3D12FsrFoveation::convert(ID3D12GraphicsCommandList* list,unsigned eye,
     const DlssMotionVectorFrame& c,const DlssMotionVectorFrame& old,
@@ -112,7 +135,8 @@ HRESULT D3D12FsrFoveation::convert(ID3D12GraphicsCommandList* list,unsigned eye,
         p.size[0]=std::max(1u,UINT(std::ceil(input.color_rect.width*density)));
         p.size[1]=std::max(1u,UINT(std::ceil(input.color_rect.height*density)));
         auto& s=*impl_;auto hr=s.initialize(list);if(FAILED(hr))return hr;
-        auto& e=s.eyes[eye];hr=s.textures(e,p.size[0],p.size[1]);if(FAILED(hr))return hr;
+        hr=s.textures(eye,p.size[0],p.size[1]);if(FAILED(hr))return hr;
+        auto& e=s.eyes[eye];e=s.scratch->eyes[eye];
         auto cpu=s.heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(eye*6)*s.stride;
         std::array<D3D12_RESOURCE_BARRIER,6> barriers{};unsigned count{};
         const auto transition=[&](ID3D12Resource* resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
@@ -147,6 +171,7 @@ HRESULT D3D12FsrFoveation::convert(ID3D12GraphicsCommandList* list,unsigned eye,
         input.depth=e.depth.Get();input.motion_vectors=e.motion.Get();input.depth_state=input.motion_state=D3D12_RESOURCE_STATE_COMMON;
         input.depth_rect=input.motion_rect={0,0,p.size[0],p.size[1]};input.motion_scale_x=float(p.size[0]);input.motion_scale_y=float(p.size[1]);
         input.jitter_x=input.jitter_y=0;input.motion_vectors_jittered=false;
+        input.borrow_owned_guides=true;
         input.camera_fov_vertical=fov.angle_up-fov.angle_down;
         return S_OK;
     }catch(...) {return E_FAIL;}

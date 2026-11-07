@@ -985,6 +985,9 @@ struct D3D12FrameSynthesizer::Impl {
     D3D12GuideComposer guide_composer;
     bool guide_composer_tried{}, guide_composer_ready{};
     std::array<WorkSlot, kWorkSlotCount> work_slots;
+    // All conversions and AMD consumption execute in order on this synth's
+    // queue. Descriptors and old-size allocations remain pinned per work slot.
+    std::shared_ptr<D3D12FsrFoveation::Scratch> fsr_scratch = D3D12FsrFoveation::make_scratch();
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     UINT current_rtv_base{};
     ComPtr<ID3D12RootSignature> root_signature;
@@ -3863,7 +3866,7 @@ struct D3D12FrameSynthesizer::Impl {
                 if(cinema_projection||!previous_source.motion_vectors||
                     guide_eye>=previous_source.motion_vectors->eye_count||
                     !previous_source.motion_vectors->eyes[guide_eye])return DXGI_ERROR_WAS_STILL_DRAWING;
-                if(!slot.fsr_foveation)slot.fsr_foveation=std::make_unique<D3D12FsrFoveation>();
+                if(!slot.fsr_foveation)slot.fsr_foveation=std::make_unique<D3D12FsrFoveation>(fsr_scratch);
                 slot.fsr_foveation_inputs=guides;
                 const auto hr=slot.fsr_foveation->convert(slot.command_list.Get(),view_index,guide,
                     *previous_source.motion_vectors->eyes[guide_eye],current_source.views[view_index].fov,
