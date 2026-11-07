@@ -33,6 +33,49 @@ int main(){try {
     require(margin.runtime_ready(40*ms,2*ms)==0 && margin.deadline()==43*ms,"retained native margin unnecessarily grew on early input");
     require(margin.delivered(43*ms) && margin.delay()==1*ms,"native margin was lost on the following cycle");
     xrfg::PrivatePhysicalSchedule grid;
+    // MSFS 2026-11-07: completed images missed a physical slot solely because
+    // native Begin completion was charged a second 1.1ms forecast. Times are
+    // captured QPC nanoseconds relative to the skipped slot, including clock
+    // resampling between the previous and current packet. Sources: packets
+    // 43809/43819/43827 (Medium) and 51707/51763 (Low).
+    struct PreparedWitness {
+        std::int64_t prior_deadline,prior_handoff,accepted,prepared,native_ready,released;
+    };
+    constexpr PreparedWitness prepared_witnesses[]{
+        {-10'836'401,-10'834'321,-20'296'821,-12'109'221,-1'092'521,-1'050'321},
+        {-10'730'260,-10'728'180,-20'084'980,-10'911'180,-914'480,-869'580},
+        {-10'748'240,-10'746'160,-20'391'660,-10'788'760,-916'260,-795'360},
+        {-11'122'220,-11'120'220,-20'871'820,-11'947'620,-503'520,-238'620},
+        {-10'341'801,-10'339'721,-20'159'421,-12'020'421,-914'521,-864'121},
+    };
+    for(const auto& w:prepared_witnesses) {
+        constexpr std::int64_t p=11'122'220,base=1'000'000'000;
+        xrfg::PrivatePhysicalSchedule previous;
+        require(previous.clock({base+w.prior_deadline+ms,p,100}),"captured previous physical clock");
+        require(previous.claim_prepared(base-3*p,base-3*p,base-3*p)==base+w.prior_deadline,
+            "previous captured slot moved");
+        require(previous.delivered(base+w.prior_handoff),"previous captured handoff rejected");
+        require(previous.clock({base+ms,p,101}),"captured resampled physical clock");
+        auto old_policy=previous;
+        old_policy.claim(base+w.accepted,base+w.prepared,base+w.native_ready,
+            base+w.released,xrfg::PrivateRuntimeBudget::presentation_margin);
+        require(old_policy.slot()==102,"captured timing no longer reproduces the old missed slot");
+        auto ready=previous;
+        const auto at=ready.claim_prepared(base+w.accepted,base+w.prepared,base+w.released);
+        require(ready.slot()==101 && at<base+ms,"already prepared output missed its usable physical slot");
+        require(at>=base+w.released+xrfg::PrivateOutputSchedule::preparation_lead,
+            "prepared output bypassed final CPU preparation guard");
+        require(!ready.delivered(at-1) && ready.delivered(at+2'000),"prepared output ignored its handoff deadline");
+        const auto next=ready.claim_prepared(base+w.accepted,base+w.prepared,at+2'000);
+        require(ready.slot()==102 && next>=at+2'000+p-100'000,"ready output reused a slot or caused a catch-up burst");
+        auto late=previous;
+        late.claim_prepared(base+w.accepted,base+w.prepared,base-50'000);
+        require(late.slot()==102,"actually late preparation bypassed the remaining CPU guard");
+        auto pending=previous;
+        pending.claim_prepared(base+w.accepted,base+ms,base+w.released);
+        require(pending.slot()==102,"unfinished source became eligible for an earlier slot");
+    }
+    std::cout<<"Prepared frame cadence: captured MSFS ready slots, late input guard and no catch-up PASS\n";
     for(const auto& w:ready_slot_witnesses) {
         constexpr std::int64_t p=11'111'111,base=1'000'000'000;
         xrfg::PrivatePhysicalSchedule ready;
