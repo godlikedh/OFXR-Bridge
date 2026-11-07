@@ -4,11 +4,14 @@
 #include <memory>
 namespace xrfg {
 struct D3D12FsrEyeInput;
-// One instance per OFXR work slot: descriptors/textures are reused only after
-// that slot's fence. Inputs remain pinned by the slot until submission retires.
+// One instance per work slot: descriptors and resource references remain live
+// until its fence. Scratch may be shared only by serial recordings submitted
+// in order on ONE queue; each recording must finish consuming it before return.
 class D3D12FsrFoveation {
 public:
-    D3D12FsrFoveation();
+    struct Scratch;
+    static std::shared_ptr<Scratch> make_scratch();
+    explicit D3D12FsrFoveation(std::shared_ptr<Scratch> scratch = {});
     ~D3D12FsrFoveation();
     HRESULT convert(ID3D12GraphicsCommandList* list, unsigned eye,
         const DlssMotionVectorFrame& current, const DlssMotionVectorFrame& previous,

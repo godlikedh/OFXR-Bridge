@@ -13,6 +13,7 @@
 #include <fstream>
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "../src/d3d12/d3d12_fsr_frame_generator.hpp"
+#include "xrfg/d3d12_fsr_foveation.hpp"
 #include "../src/d3d12/d3d12_fsr_performance.hpp"
 
 #include <windows.h>
@@ -5702,6 +5703,7 @@ int main(int argc, char** argv) {
         }
         if (argc>1 && std::string_view(argv[1])=="fsr-warp") {
             D3D12WarpFixture fixture;
+            test_fsr_shared_scratch(fixture);
             test_fsr_provider_stereo(fixture);
             test_synthetic_camera_follows_display_pose(fixture,SyntheticCameraPath::fsr,false);
             fixture.require_no_debug_errors();
