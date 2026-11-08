@@ -179,7 +179,10 @@ struct Snapshot {
 };
 
 enum class DiagnosticsPhase : unsigned { idle, queued, running, complete, failed };
-enum class DiagnosticsDetail : unsigned { saved, basic, detailed };
+enum class DiagnosticsDetail : unsigned { saved, basic, detailed, system_basic, system_detailed };
+constexpr bool diagnostics_system_trace(DiagnosticsDetail detail) noexcept {
+    return detail == DiagnosticsDetail::system_basic || detail == DiagnosticsDetail::system_detailed;
+}
 struct DiagnosticsStatus {
     DiagnosticsPhase phase{};
     bool available{};
@@ -187,6 +190,7 @@ struct DiagnosticsStatus {
     std::uint64_t heartbeat_ms{}, request_id{};
     char zip_path[2048]{}, message[512]{}; // UTF-8, transient; never saved to settings
     DiagnosticsDetail detail{}; // fixed when queued; interpreted by companion tools
+    bool system_trace_available{}; // companion prepared permission before entering VR
 };
 inline bool diagnostics_active(const DiagnosticsStatus& value) noexcept {
     return value.phase == DiagnosticsPhase::queued || value.phase == DiagnosticsPhase::running;
@@ -198,7 +202,7 @@ bool request_diagnostics(DiagnosticsDetail detail = DiagnosticsDetail::saved) no
 // Launch the installed companion tool on a worker thread; never run collection in the game.
 bool launch_provider_tools(bool collect, DiagnosticsDetail detail = DiagnosticsDetail::saved) noexcept;
 // Tray only: heartbeat, recover an exited controller, and claim at most one request.
-DiagnosticsStatus take_diagnostics_request(bool available) noexcept;
+DiagnosticsStatus take_diagnostics_request(bool available, bool system_trace_available = false) noexcept;
 bool report_diagnostics(const DiagnosticsStatus& result) noexcept;
 
 // Once per trial, captured in the game process on its rendering adapter.

@@ -181,6 +181,21 @@ void headset_diagnostic_controls() {
         "diagnostic detail cannot reconfigure frame generation");
     headset.activate("/Generation_","Detailed execution timeline");headset.draw();headset.draw();
     require(!headset.widgets.detailed_diagnostics,"headset navigation restores basic capture");
+    require(headset.rendered_text.find("Windows CPU/GPU scheduling trace")!=std::string::npos,
+        "headset exposes Windows trace selection");
+    (void)take_diagnostics_request(true,true);
+    headset.draw();headset.draw();
+    headset.activate("/Generation_","Windows CPU/GPU scheduling trace");headset.draw();headset.draw();
+    require(headset.widgets.system_diagnostics,"prepared companion enables headset Windows trace");
+    require(snapshot().revision==revision && snapshot().desired==settings,
+        "Windows trace preference cannot reconfigure frame generation");
+    require(request_diagnostics(DiagnosticsDetail::system_detailed),"combined capture queued through IPC");
+    const auto request=take_diagnostics_request(true,true);
+    require(request.detail==DiagnosticsDetail::system_detailed,"combined mode survives claiming");
+    auto completed=request;completed.phase=DiagnosticsPhase::complete;
+    require(report_diagnostics(completed),"finish fixture request");
+    (void)take_diagnostics_request(true,false);
+    require(!request_diagnostics(DiagnosticsDetail::system_basic),"unprepared companion cannot silently downgrade Windows trace");
 }
 void route_motion_widgets() {
     auto settings = snapshot().desired;
