@@ -80,7 +80,7 @@ std::string_view generation_status_text(int mode, int motion_source, GenerationS
 }
 namespace {
 constexpr std::uint32_t kMagic = 0x41465952;
-constexpr std::uint32_t kAbi = 77305;
+constexpr std::uint32_t kAbi = 77306;
 std::atomic_uint overlay_limits{};
 static_assert(offsetof(RuntimeStatus, provider_error)==80); // V611 IPC layout
 static_assert(offsetof(RuntimeStatus, afw_running)==77); // V611 AFW activity field
@@ -605,7 +605,11 @@ bool benchmark_enabled() noexcept {
 }
 
 bool launch_provider_tools(bool collect, DiagnosticsDetail detail) noexcept {
-    if(detail>DiagnosticsDetail::detailed)return false;
+    if(detail>DiagnosticsDetail::system_detailed)return false;
+    if(collect && request_diagnostics(detail))return true;
+    // Permission is prepared by the companion before VR. Never show UAC from
+    // a headset click or silently downgrade a requested system trace.
+    if(collect && diagnostics_system_trace(detail))return false;
 #ifdef _WIN32
     // The companion lives in the provider package. It owns single-instance
     // arbitration and the diagnostic worker; OFXR only launches it.
@@ -646,19 +650,20 @@ DiagnosticsStatus diagnostics_snapshot() noexcept {
 #ifdef _WIN32
         const auto now = GetTickCount64();
         if (!result.heartbeat_ms || now < result.heartbeat_ms || now - result.heartbeat_ms > 5000)
-            result.available = false;
+            result.available = result.system_trace_available = false;
 #endif
         return result;
     } catch (...) { return {}; }
 }
 bool request_diagnostics(DiagnosticsDetail detail) noexcept {
-    if(detail>DiagnosticsDetail::detailed)return false;
+    if(detail>DiagnosticsDetail::system_detailed)return false;
     try {
         auto& c = profile_channel(global_configuration_path());
         Lock lock(c);
         if (!lock.acquired) return false;
         auto& d = c.data->diagnostics;
         if (!d.available || diagnostics_active(d)) return false;
+        if (diagnostics_system_trace(detail) && !d.system_trace_available) return false;
 #ifdef _WIN32
         const auto now = GetTickCount64();
         if (!d.heartbeat_ms || now < d.heartbeat_ms || now - d.heartbeat_ms > 5000) return false;
@@ -670,7 +675,7 @@ bool request_diagnostics(DiagnosticsDetail detail) noexcept {
         return true;
     } catch (...) { return false; }
 }
-DiagnosticsStatus take_diagnostics_request(bool available) noexcept {
+DiagnosticsStatus take_diagnostics_request(bool available, bool system_trace_available) noexcept {
     try {
         auto& c = profile_channel(global_configuration_path());
         Lock lock(c);
@@ -694,6 +699,7 @@ DiagnosticsStatus take_diagnostics_request(bool available) noexcept {
         d.heartbeat_ms = GetTickCount64();
 #endif
         d.available = available;
+        d.system_trace_available = available && system_trace_available;
         if (d.phase != DiagnosticsPhase::queued) return {};
         d.phase = available ? DiagnosticsPhase::running : DiagnosticsPhase::failed;
         if (!available) std::strcpy(d.message, "Collector missing. Extract the complete package, including scripts.");

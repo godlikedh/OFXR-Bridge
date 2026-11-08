@@ -164,8 +164,14 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
     ImGui::BeginDisabled(diagnostics_active(diagnostics) && diagnostics.available);
     ImGui::Checkbox("Detailed execution timeline",&ui.detailed_diagnostics);
     if(ImGui::IsItemHovered())ImGui::SetTooltip("For captures started here: record detailed timings during collection only. May affect FPS. Starts off for a new menu session.");
+    ImGui::BeginDisabled(!diagnostics.system_trace_available);
+    ImGui::Checkbox("Windows CPU/GPU scheduling trace",&ui.system_diagnostics);
+    ImGui::EndDisabled();
+    if(!diagnostics.system_trace_available)
+        ImGui::TextWrapped("Windows tracing needs permission at package startup, before entering VR.");
     if (ImGui::Button("Collect diagnostics")) ui.diagnostics_request_failed = !launch_provider_tools(true,
-        ui.detailed_diagnostics?DiagnosticsDetail::detailed:DiagnosticsDetail::basic);
+        ui.system_diagnostics ? (ui.detailed_diagnostics?DiagnosticsDetail::system_detailed:DiagnosticsDetail::system_basic) :
+            (ui.detailed_diagnostics?DiagnosticsDetail::detailed:DiagnosticsDetail::basic));
     ImGui::EndDisabled();
     ImGui::SameLine();
     if(ImGui::Button("Open provider tools (desktop)")) ui.diagnostics_request_failed = !launch_provider_tools(false);
@@ -177,7 +183,7 @@ bool generation(SettingsWidgetState& ui, const Snapshot& state, bool compact) {
         ImGui::TextWrapped("Collection failed: %s", diagnostics.message);
     } else if (diagnostics_active(diagnostics)) {
         ImGui::SameLine();
-        ImGui::TextUnformatted(diagnostics.available ? "Collecting... Observing at least 15 seconds. Keep playing; you can close F10." : "Collector not responding. Open provider tools.");
+        ImGui::TextWrapped("%s",diagnostics.available ? "Collecting... Keep playing; you can close F10. Saving a Windows trace can take longer." : "Collector not responding. Try Collect diagnostics again.");
     } else if (!diagnostics.available) {
         ImGui::TextWrapped("Collect diagnostics starts the collector in the background. You can keep your headset on.");
     } else {

@@ -18,6 +18,7 @@ struct SettingsWidgetState {
     bool save_failed{};
     bool diagnostics_request_failed{};
     bool detailed_diagnostics{}; // capture preference for this UI, not generation settings
+    bool system_diagnostics{};
     bool dlssg_profile_loaded{};
     bool dlssg_target_saved{};
     unsigned dlssg_observed_pid{};
